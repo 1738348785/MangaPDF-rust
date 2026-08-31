@@ -1,0 +1,45 @@
+[package]
+name = "pdf_tool"
+version = "1.0.0"
+edition = "2021"
+authors = ["Antigravity"]
+description = "Modern & High-Performance Comic/Image to PDF packaging GUI tool"
+
+[dependencies]
+# 现代化轻量 GUI 引擎（纯 Rust、极速渲染、低内存）
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui_extras = { version = "0.29", features = ["image"] }
+
+# 原生文件与文件夹选择对话框
+rfd = "0.15"
+
+# PDF 底层流式生成引擎
+pdf-writer = "0.12"
+
+# 图像解码与缩略图生成
+image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg", "bmp"] }
+
+# 极速获取图片尺寸
+imagesize = "0.13"
+
+# 自然排序算法 (1.jpg -> 2.jpg -> 10.jpg)
+natord = "1.0"
+
+# 漫画归档支持 (.zip 与 .cbz)
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# 多线程并行加速
+rayon = "1.10"
+
+# 错误处理
+anyhow = "1.0"
+
+# zlib 压缩
+miniz_oxide = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

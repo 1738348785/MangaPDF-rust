@@ -1,0 +1,16 @@
+# Rust target build output
+/target/
+**/*.rs.bk
+
+# Compiled binary executables
+*.exe
+*.pdb
+*.dll
+
+# System and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+.system_generated/
