@@ -1,6 +1,6 @@
 [package]
 name = "pdf_tool"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 authors = ["Antigravity"]
 description = "Modern & High-Performance Comic/Image to PDF packaging GUI tool"

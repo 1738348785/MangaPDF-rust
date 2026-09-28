@@ -1025,7 +1025,7 @@ impl eframe::App for MangaPdfApp {
                         ui.add_space(2.0);
                         ui.heading("MangaPDF 漫画与图片打包工具");
                         ui.add_space(2.0);
-                        ui.label(egui::RichText::new("版本 v1.0.1 · 现代轻量 GUI").color(text_muted));
+                        ui.label(egui::RichText::new("版本 v1.0.2 · 现代轻量 GUI").color(text_muted));
                         ui.add_space(4.0);
 
                         // GitHub 小图标与小字转跳链接
@@ -1083,6 +1083,7 @@ impl eframe::App for MangaPdfApp {
 
                     // 靠左整齐排列特性要点
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.label("• 高清画廊大图预览 (自适应窗口、1:1 原图与键盘快捷翻页)");
                         ui.label("• 原画无损直存 (JPEG 直通 + PNG 原生无损保留)");
                         ui.label("• 多核并行转码加速 (Rayon 线程池分批并发满载)");
                         ui.label("• 智能全路径自然语义排序 (1.jpg -> 2.jpg -> 10.jpg)");
@@ -1158,19 +1159,24 @@ impl eframe::App for MangaPdfApp {
                 let mut is_open = true;
 
                 let window_title = format!(
-                    "🖼️ 大图预览 - {} ({} × {}, 第 {}/{} 页)",
-                    item_name, item_width, item_height, cur_idx + 1, total_pages
+                    "图片预览 (第 {}/{} 页) - {}",
+                    cur_idx + 1, total_pages, item_name
                 );
 
                 let screen_rect = ctx.screen_rect();
                 let default_w = (screen_rect.width() * 0.85).min(1080.0);
                 let default_h = (screen_rect.height() * 0.88).min(840.0);
+                let default_pos = egui::pos2(
+                    (screen_rect.width() - default_w).max(0.0) / 2.0 + screen_rect.min.x,
+                    (screen_rect.height() - default_h).max(0.0) / 2.0 + screen_rect.min.y,
+                );
 
                 egui::Window::new(window_title)
+                    .id(egui::Id::new("image_preview_window"))
                     .open(&mut is_open)
+                    .default_pos(default_pos)
                     .default_size(Vec2::new(default_w, default_h))
                     .min_size(Vec2::new(420.0, 320.0))
-                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                     .resizable(true)
                     .collapsible(false)
                     .order(egui::Order::Foreground)
@@ -1186,7 +1192,7 @@ impl eframe::App for MangaPdfApp {
                             close_preview = true;
                         }
 
-                        // 预览控制栏
+                        // 预览控制栏 (极简整洁，无重复关闭按钮)
                         ui.horizontal(|ui| {
                             if ui.add_enabled(cur_idx > 0, egui::Button::new("◀ 上一页 (←)")).clicked() {
                                 switch_idx = Some(cur_idx.saturating_sub(1));
@@ -1198,44 +1204,55 @@ impl eframe::App for MangaPdfApp {
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new(format!("第 {} / {} 页", cur_idx + 1, total_pages)).strong());
 
-                            ui.add_space(12.0);
+                            ui.add_space(10.0);
                             ui.separator();
-                            ui.add_space(12.0);
+                            ui.add_space(10.0);
 
                             ui.selectable_value(&mut self.preview_actual_size, false, "适应窗口");
                             ui.selectable_value(&mut self.preview_actual_size, true, "100% 原始尺寸");
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("✕ 关闭 (Esc)").clicked() {
-                                    close_preview = true;
-                                }
-                                ui.label(egui::RichText::new(format!("{} × {} px", item_width, item_height)).color(text_muted));
+                                ui.label(egui::RichText::new(format!("{} × {} px · 按 Esc 退出", item_width, item_height)).color(text_muted));
                             });
                         });
 
                         ui.separator();
 
-                        // 图片展示区
+                        // 图片展示区：平滑居中自适应缩放
                         if let Some((_, tex)) = &self.preview_texture {
                             if self.preview_actual_size {
-                                egui::ScrollArea::both().show(ui, |ui| {
-                                    ui.centered_and_justified(|ui| {
+                                egui::ScrollArea::both()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
                                         ui.image((tex.id(), tex.size_vec2()));
                                     });
-                                });
                             } else {
                                 let avail_size = ui.available_size();
-                                let tex_size = tex.size_vec2();
-                                let aspect_ratio = tex_size.x / tex_size.y.max(1.0);
-                                let mut draw_w = avail_size.x;
-                                let mut draw_h = draw_w / aspect_ratio;
-                                if draw_h > avail_size.y {
-                                    draw_h = avail_size.y;
-                                    draw_w = draw_h * aspect_ratio;
+                                if avail_size.x > 10.0 && avail_size.y > 10.0 {
+                                    let tex_size = tex.size_vec2();
+                                    let aspect_ratio = tex_size.x / tex_size.y.max(1.0);
+                                    let mut fit_w = avail_size.x;
+                                    let mut fit_h = fit_w / aspect_ratio;
+                                    if fit_h > avail_size.y {
+                                        fit_h = avail_size.y;
+                                        fit_w = fit_h * aspect_ratio;
+                                    }
+
+                                    let x_pad = (avail_size.x - fit_w) / 2.0;
+                                    let y_pad = (avail_size.y - fit_h) / 2.0;
+
+                                    ui.horizontal(|ui| {
+                                        if x_pad > 0.0 {
+                                            ui.add_space(x_pad);
+                                        }
+                                        ui.vertical(|ui| {
+                                            if y_pad > 0.0 {
+                                                ui.add_space(y_pad);
+                                            }
+                                            ui.image((tex.id(), Vec2::new(fit_w, fit_h)));
+                                        });
+                                    });
                                 }
-                                ui.centered_and_justified(|ui| {
-                                    ui.image((tex.id(), Vec2::new(draw_w, draw_h)));
-                                });
                             }
                         } else {
                             ui.centered_and_justified(|ui| {
