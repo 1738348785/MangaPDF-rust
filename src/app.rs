@@ -31,6 +31,9 @@ pub struct MangaPdfApp {
     app_logo_texture: Option<egui::TextureHandle>,
     github_logo_texture: Option<egui::TextureHandle>,
     frame_count: usize,
+    preview_image_idx: Option<usize>,
+    preview_texture: Option<(usize, egui::TextureHandle)>,
+    preview_actual_size: bool,
 }
 
 enum TaskMessage {
@@ -64,6 +67,9 @@ impl MangaPdfApp {
             app_logo_texture: None,
             github_logo_texture: None,
             frame_count: 0,
+            preview_image_idx: None,
+            preview_texture: None,
+            preview_actual_size: false,
         }
     }
 
@@ -121,6 +127,12 @@ impl MangaPdfApp {
             .flat_map(|s| s.items.iter().map(|i| i.id))
             .collect();
         self.texture_cache.retain(|id, _| valid_ids.contains(id));
+        if let Some((id, _)) = &self.preview_texture {
+            if !valid_ids.contains(id) {
+                self.preview_texture = None;
+                self.preview_image_idx = None;
+            }
+        }
         trim_process_memory();
     }
 
@@ -895,6 +907,7 @@ impl eframe::App for MangaPdfApp {
 
                     let mut swap_action = None;
                     let mut remove_action = None;
+                    let mut preview_action = None;
 
                     egui::Grid::new("image_cards_grid")
                         .spacing(Vec2::new(14.0, 16.0))
@@ -908,10 +921,17 @@ impl eframe::App for MangaPdfApp {
                                     .show(ui, |ui| {
                                         ui.set_width(card_w);
                                         ui.vertical_centered(|ui| {
-                                            if let Some(texture) = self.texture_cache.get(&item.id) {
-                                                ui.image((texture.id(), Vec2::new(112.0, 148.0)));
+                                            let img_resp = if let Some(texture) = self.texture_cache.get(&item.id) {
+                                                let img_btn = egui::ImageButton::new((texture.id(), Vec2::new(112.0, 148.0)))
+                                                    .frame(false);
+                                                ui.add(img_btn)
                                             } else {
-                                                ui.allocate_space(Vec2::new(112.0, 148.0));
+                                                ui.allocate_response(Vec2::new(112.0, 148.0), egui::Sense::click())
+                                            };
+
+                                            let img_resp = img_resp.on_hover_text("🔍 点击放大预览此图片");
+                                            if img_resp.clicked() {
+                                                preview_action = Some(idx);
                                             }
 
                                             ui.add_space(4.0);
@@ -943,6 +963,9 @@ impl eframe::App for MangaPdfApp {
                                                 if ui.small_button("▶").on_hover_text("后移").clicked() {
                                                     swap_action = Some((idx, idx + 1));
                                                 }
+                                                if ui.small_button("🔍").on_hover_text("放大预览").clicked() {
+                                                    preview_action = Some(idx);
+                                                }
                                                 if ui.small_button("×").on_hover_text("移除").clicked() {
                                                     remove_action = Some(idx);
                                                 }
@@ -970,6 +993,10 @@ impl eframe::App for MangaPdfApp {
                             seq.remove_at(idx);
                             self.texture_cache.remove(&removed_id);
                         }
+                    }
+
+                    if let Some(idx) = preview_action {
+                        self.preview_image_idx = Some(idx);
                     }
                 });
             }
@@ -1078,6 +1105,156 @@ impl eframe::App for MangaPdfApp {
 
             if close_dialog {
                 self.show_about_dialog = false;
+            }
+        }
+
+        // 5.5 图片大图预览浮窗 / 画廊查看器
+        if let Some(cur_idx) = self.preview_image_idx {
+            let page_info = {
+                let current_seq = self.current_sequence();
+                if cur_idx >= current_seq.items.len() {
+                    None
+                } else {
+                    let item = &current_seq.items[cur_idx];
+                    Some((
+                        item.id,
+                        item.name.clone(),
+                        item.width,
+                        item.height,
+                        current_seq.items.len(),
+                        item.get_bytes(),
+                    ))
+                }
+            };
+
+            if let Some((item_id, item_name, item_width, item_height, total_pages, bytes_res)) = page_info {
+                // 载入大图的高清渲染纹理 (若尚未缓存此图)
+                if self.preview_texture.as_ref().map(|(id, _)| *id) != Some(item_id) {
+                    if let Ok(bytes) = bytes_res {
+                        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                            let max_dim = 2560;
+                            let img_to_show = if dyn_img.width() > max_dim || dyn_img.height() > max_dim {
+                                dyn_img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+                            } else {
+                                dyn_img
+                            };
+                            let rgba = img_to_show.to_rgba8();
+                            let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                                [rgba.width() as usize, rgba.height() as usize],
+                                &rgba,
+                            );
+                            let tex = ctx.load_texture(
+                                "large_preview_texture",
+                                color_img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.preview_texture = Some((item_id, tex));
+                        }
+                    }
+                }
+
+                let mut close_preview = false;
+                let mut switch_idx = None;
+                let mut is_open = true;
+
+                let window_title = format!(
+                    "🖼️ 大图预览 - {} ({} × {}, 第 {}/{} 页)",
+                    item_name, item_width, item_height, cur_idx + 1, total_pages
+                );
+
+                let screen_rect = ctx.screen_rect();
+                let default_w = (screen_rect.width() * 0.85).min(1080.0);
+                let default_h = (screen_rect.height() * 0.88).min(840.0);
+
+                egui::Window::new(window_title)
+                    .open(&mut is_open)
+                    .default_size(Vec2::new(default_w, default_h))
+                    .min_size(Vec2::new(420.0, 320.0))
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .resizable(true)
+                    .collapsible(false)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        // 快捷键支持：← 上一页，→ 下一页，Esc 关闭
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && cur_idx > 0 {
+                            switch_idx = Some(cur_idx - 1);
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur_idx + 1 < total_pages {
+                            switch_idx = Some(cur_idx + 1);
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close_preview = true;
+                        }
+
+                        // 预览控制栏
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(cur_idx > 0, egui::Button::new("◀ 上一页 (←)")).clicked() {
+                                switch_idx = Some(cur_idx.saturating_sub(1));
+                            }
+                            if ui.add_enabled(cur_idx + 1 < total_pages, egui::Button::new("下一页 (→) ▶")).clicked() {
+                                switch_idx = Some(cur_idx + 1);
+                            }
+
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(format!("第 {} / {} 页", cur_idx + 1, total_pages)).strong());
+
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(12.0);
+
+                            ui.selectable_value(&mut self.preview_actual_size, false, "适应窗口");
+                            ui.selectable_value(&mut self.preview_actual_size, true, "100% 原始尺寸");
+
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("✕ 关闭 (Esc)").clicked() {
+                                    close_preview = true;
+                                }
+                                ui.label(egui::RichText::new(format!("{} × {} px", item_width, item_height)).color(text_muted));
+                            });
+                        });
+
+                        ui.separator();
+
+                        // 图片展示区
+                        if let Some((_, tex)) = &self.preview_texture {
+                            if self.preview_actual_size {
+                                egui::ScrollArea::both().show(ui, |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.image((tex.id(), tex.size_vec2()));
+                                    });
+                                });
+                            } else {
+                                let avail_size = ui.available_size();
+                                let tex_size = tex.size_vec2();
+                                let aspect_ratio = tex_size.x / tex_size.y.max(1.0);
+                                let mut draw_w = avail_size.x;
+                                let mut draw_h = draw_w / aspect_ratio;
+                                if draw_h > avail_size.y {
+                                    draw_h = avail_size.y;
+                                    draw_w = draw_h * aspect_ratio;
+                                }
+                                ui.centered_and_justified(|ui| {
+                                    ui.image((tex.id(), Vec2::new(draw_w, draw_h)));
+                                });
+                            }
+                        } else {
+                            ui.centered_and_justified(|ui| {
+                                ui.label("正在加载大图预览...");
+                            });
+                        }
+                    });
+
+                if !is_open || close_preview {
+                    self.preview_image_idx = None;
+                    self.preview_texture = None;
+                    trim_process_memory();
+                } else if let Some(new_idx) = switch_idx {
+                    self.preview_image_idx = Some(new_idx);
+                }
+            } else {
+                self.preview_image_idx = None;
+                self.preview_texture = None;
+                trim_process_memory();
             }
         }
 
