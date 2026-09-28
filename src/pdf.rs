@@ -7,7 +7,15 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-pub fn build_pdf_from_sequence<P: AsRef<Path>>(sequence: &Sequence, output_path: P) -> Result<usize> {
+pub fn build_pdf_from_sequence<P, F>(
+    sequence: &Sequence,
+    output_path: P,
+    progress_callback: Option<F>,
+) -> Result<usize>
+where
+    P: AsRef<Path>,
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     if sequence.items.is_empty() {
         anyhow::bail!("序列中没有任何图片");
     }
@@ -19,21 +27,28 @@ pub fn build_pdf_from_sequence<P: AsRef<Path>>(sequence: &Sequence, output_path:
     let mut next_id = 3;
     let mut page_ids = Vec::with_capacity(sequence.items.len());
     let mut success_count = 0;
+    let total_items = sequence.items.len();
 
     let margin_pt = (sequence.margin_mm as f32) * (72.0 / 25.4); // mm 转 point (1 inch = 25.4mm = 72pt)
 
     // 分批多核并行转码 (每批 32 张，充分释放多核性能且将内存峰值严格控制在几十兆内)
     const CHUNK_SIZE: usize = 32;
+    let processed_counter = std::sync::atomic::AtomicUsize::new(0);
 
     for chunk in sequence.items.chunks(CHUNK_SIZE) {
         let processed_chunk: Vec<Result<crate::img::ProcessedImage>> = chunk
             .par_iter()
             .map(|item| {
-                crate::img::process_image_bytes(
+                let res = crate::img::process_image_bytes(
                     item.bytes.clone(),
                     sequence.lossless_direct,
                     sequence.quality,
-                )
+                );
+                let current_done = processed_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Some(cb) = &progress_callback {
+                    cb(current_done, total_items, &item.name);
+                }
+                res
             })
             .collect();
 

@@ -230,13 +230,17 @@ impl MangaPdfApp {
         let tx = self.task_sender.clone();
 
         thread::spawn(move || {
-            let _ = tx.send(TaskMessage::Progress {
-                current: 1,
-                total: 2,
-                desc: "正在处理图片并封装 PDF...".to_string(),
-            });
+            let callback_tx = tx.clone();
+            let cb = move |current: usize, total: usize, name: &str| {
+                let percent = (current as f32 / total.max(1) as f32) * 100.0;
+                let _ = callback_tx.send(TaskMessage::Progress {
+                    current,
+                    total,
+                    desc: format!("正在打包 [{}/{}]: {} ({:.0}%)", current, total, name, percent),
+                });
+            };
 
-            match crate::pdf::build_pdf_from_sequence(&seq, &final_path) {
+            match crate::pdf::build_pdf_from_sequence(&seq, &final_path, Some(cb)) {
                 Ok(count) => {
                     let _ = tx.send(TaskMessage::Finished {
                         success_count: count,
@@ -273,7 +277,7 @@ impl MangaPdfApp {
         let tx = self.task_sender.clone();
 
         thread::spawn(move || {
-            let total = sequences.len();
+            let total_seqs = sequences.len();
             let mut success_total = 0;
 
             for (idx, seq) in sequences.into_iter().enumerate() {
@@ -286,13 +290,19 @@ impl MangaPdfApp {
                 };
                 let final_path = out_dir.join(pdf_name);
 
-                let _ = tx.send(TaskMessage::Progress {
-                    current: idx + 1,
-                    total,
-                    desc: format!("正在打包 [{}/{}]: {}", idx + 1, total, seq.name),
-                });
+                let callback_tx = tx.clone();
+                let seq_name = seq.name.clone();
+                let cb = move |current: usize, total: usize, _name: &str| {
+                    let overall_current = idx * 100 + (current * 100 / total.max(1));
+                    let overall_total = total_seqs * 100;
+                    let _ = callback_tx.send(TaskMessage::Progress {
+                        current: overall_current,
+                        total: overall_total,
+                        desc: format!("批量打包 [{}/{}]: {} (第 {}/{} 页)", idx + 1, total_seqs, seq_name, current, total),
+                    });
+                };
 
-                if let Ok(_) = crate::pdf::build_pdf_from_sequence(&seq, &final_path) {
+                if let Ok(_) = crate::pdf::build_pdf_from_sequence(&seq, &final_path, Some(cb)) {
                     success_total += 1;
                 }
             }
@@ -388,6 +398,10 @@ impl eframe::App for MangaPdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_async_messages();
         self.apply_modern_styling(ctx);
+
+        if self.is_generating {
+            ctx.request_repaint();
+        }
 
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped_files.is_empty() {
