@@ -94,17 +94,15 @@ pub fn load_entries_from_paths(paths: &[PathBuf], mut start_id: usize) -> Vec<Im
         natord::compare_ignore_case(&a_str, &b_str)
     });
 
-    let raw_files: Vec<(usize, String, Vec<u8>)> = sorted_paths
+    let raw_files: Vec<(usize, String, PathBuf)> = sorted_paths
         .into_iter()
         .filter_map(|p| {
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                 if is_image_extension(ext) {
-                    if let Ok(bytes) = fs::read(&p) {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        let id = start_id;
-                        start_id += 1;
-                        return Some((id, name, bytes));
-                    }
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let id = start_id;
+                    start_id += 1;
+                    return Some((id, name, p));
                 }
             }
             None
@@ -113,7 +111,10 @@ pub fn load_entries_from_paths(paths: &[PathBuf], mut start_id: usize) -> Vec<Im
 
     raw_files
         .into_par_iter()
-        .map(|(id, name, bytes)| create_image_entry(id, name, bytes))
+        .map(|(id, name, path)| {
+            let bytes = fs::read(&path).unwrap_or_default();
+            create_image_entry(id, name, bytes, Some(path))
+        })
         .collect()
 }
 
@@ -191,7 +192,7 @@ pub fn load_entries_from_archive(archive_path: &Path, mut start_id: usize) -> Re
 
     let entries = raw_items
         .into_par_iter()
-        .map(|(id, name, bytes)| create_image_entry(id, name, bytes))
+        .map(|(id, name, bytes)| create_image_entry(id, name, bytes, None))
         .collect();
 
     Ok(entries)

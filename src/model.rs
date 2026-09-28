@@ -25,12 +25,23 @@ impl PageSizeMode {
 pub struct ImageEntry {
     pub id: usize,
     pub name: String,
+    pub source_path: Option<PathBuf>,
     pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub thumb_rgb: Option<Vec<u8>>,
     pub thumb_width: usize,
     pub thumb_height: usize,
+}
+
+impl ImageEntry {
+    pub fn get_bytes(&self) -> Result<Vec<u8>, String> {
+        if let Some(path) = &self.source_path {
+            std::fs::read(path).map_err(|e| format!("无法读取图片文件 {}: {}", path.display(), e))
+        } else {
+            Ok(self.bytes.clone())
+        }
+    }
 }
 
 #[derive(Clone)]

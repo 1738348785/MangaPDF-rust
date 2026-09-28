@@ -39,8 +39,12 @@ where
         let processed_chunk: Vec<Result<crate::img::ProcessedImage>> = chunk
             .par_iter()
             .map(|item| {
+                let raw_bytes = match item.get_bytes() {
+                    Ok(b) => b,
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                };
                 let res = crate::img::process_image_bytes(
-                    item.bytes.clone(),
+                    raw_bytes,
                     sequence.lossless_direct,
                     sequence.quality,
                 );

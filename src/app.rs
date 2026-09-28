@@ -30,6 +30,7 @@ pub struct MangaPdfApp {
     scan_subfolders: bool,
     app_logo_texture: Option<egui::TextureHandle>,
     github_logo_texture: Option<egui::TextureHandle>,
+    frame_count: usize,
 }
 
 enum TaskMessage {
@@ -62,6 +63,7 @@ impl MangaPdfApp {
             scan_subfolders: false,
             app_logo_texture: None,
             github_logo_texture: None,
+            frame_count: 0,
         }
     }
 
@@ -119,6 +121,7 @@ impl MangaPdfApp {
             .flat_map(|s| s.items.iter().map(|i| i.id))
             .collect();
         self.texture_cache.retain(|id, _| valid_ids.contains(id));
+        trim_process_memory();
     }
 
     fn add_paths_to_current_sequence(&mut self, paths: Vec<PathBuf>) {
@@ -398,6 +401,12 @@ impl eframe::App for MangaPdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_async_messages();
         self.apply_modern_styling(ctx);
+
+        self.frame_count += 1;
+        // 启动后第 3 帧（字体与显卡驱动着色器初始化上屏完毕），主动修剪工作集，交还显卡驱动预分配的大量非活跃内存
+        if self.frame_count == 3 || (self.frame_count % 300 == 0 && !self.is_generating) {
+            trim_process_memory();
+        }
 
         if self.is_generating {
             ctx.request_repaint();
@@ -749,17 +758,19 @@ impl eframe::App for MangaPdfApp {
             let drop_height = 68.0;
             let (rect, response) = ui.allocate_exact_size(Vec2::new(drop_zone_rect.width(), drop_height), egui::Sense::click());
 
-            let is_drop_active = is_hovering_files || response.hovered();
+            let is_hovered = response.hovered();
 
-            let drop_bg = if is_drop_active {
+            let drop_bg = if is_hovering_files {
                 if is_dark { Color32::from_rgb(30, 58, 138) } else { Color32::from_rgb(239, 246, 255) }
+            } else if is_hovered {
+                if is_dark { Color32::from_rgb(38, 48, 65) } else { Color32::from_rgb(248, 250, 252) }
             } else if is_dark {
                 Color32::from_rgb(31, 41, 55)
             } else {
                 Color32::WHITE
             };
 
-            let drop_border = if is_drop_active {
+            let drop_border = if is_hovering_files || is_hovered {
                 primary_color
             } else if is_dark {
                 Color32::from_rgb(55, 65, 81)
@@ -767,24 +778,33 @@ impl eframe::App for MangaPdfApp {
                 Color32::from_rgb(209, 213, 219)
             };
 
-            let stroke_width = if is_drop_active { 2.0_f32 } else { 1.0_f32 };
+            let stroke_width = if is_hovering_files { 2.0_f32 } else { 1.0_f32 };
             ui.painter().rect_filled(rect, 6.0, drop_bg);
             ui.painter().rect_stroke(rect, 6.0, Stroke::new(stroke_width, drop_border));
+
+            if is_hovered && !is_hovering_files {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
 
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(13.0);
-                    let title = if is_drop_active {
+                    let title = if is_hovering_files {
                         "📥 释放鼠标立即导入漫画与图片"
                     } else {
                         "点击或将图片 / 文件夹 / CBZ 压缩包拖拽到此处"
+                    };
+                    let title_color = if is_hovering_files || is_hovered {
+                        primary_color
+                    } else {
+                        ui.visuals().text_color()
                     };
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(title)
                                 .font(FontId::proportional(14.0))
                                 .strong()
-                                .color(if is_drop_active { primary_color } else { ui.visuals().text_color() }),
+                                .color(title_color),
                         )
                         .selectable(false)
                         .sense(egui::Sense::hover()),
@@ -1134,3 +1154,23 @@ pub fn sanitize_filename(name: &str) -> String {
         trimmed.to_string()
     }
 }
+
+/// 针对 Windows 进程主动修剪工作集内存，将启动阶段显卡驱动预分配的大量非活跃编译缓存归还系统
+#[cfg(target_os = "windows")]
+pub fn trim_process_memory() {
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn SetProcessWorkingSetSize(
+                h_process: isize,
+                dw_minimum_working_set_size: usize,
+                dw_maximum_working_set_size: usize,
+            ) -> i32;
+        }
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn trim_process_memory() {}

@@ -25,8 +25,13 @@ pub struct ProcessedImage {
     pub stream_data: Vec<u8>,
 }
 
-/// 创建带有缩略图的图片条目
-pub fn create_image_entry(id: usize, name: String, bytes: Vec<u8>) -> ImageEntry {
+/// 创建带有缩略图的图片条目 (针对磁盘文件不常驻原始字节，仅保留缩略图以保证极低内存)
+pub fn create_image_entry(
+    id: usize,
+    name: String,
+    bytes: Vec<u8>,
+    source_path: Option<std::path::PathBuf>,
+) -> ImageEntry {
     let (mut width, mut height) = match imagesize::blob_size(&bytes) {
         Ok(size) => (size.width as u32, size.height as u32),
         Err(_) => (800, 1200),
@@ -46,10 +51,18 @@ pub fn create_image_entry(id: usize, name: String, bytes: Vec<u8>) -> ImageEntry
         thumb_rgb = Some(thumb.into_rgb8().into_raw());
     }
 
+    // 若图片来自本地磁盘文件，生成缩略图后立即释放原始大图字节，杜绝内存堆积
+    let stored_bytes = if source_path.is_some() {
+        Vec::new()
+    } else {
+        bytes
+    };
+
     ImageEntry {
         id,
         name,
-        bytes,
+        source_path,
+        bytes: stored_bytes,
         width,
         height,
         thumb_rgb,
