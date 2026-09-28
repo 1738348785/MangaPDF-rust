@@ -2,6 +2,7 @@ use crate::img::{ColorSpace, Filter};
 use crate::model::{PageSizeMode, Sequence};
 use anyhow::Result;
 use pdf_writer::{Content, Filter as PdfFilter, Finish, Name, Pdf, Rect, Ref};
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -21,19 +22,30 @@ pub fn build_pdf_from_sequence<P: AsRef<Path>>(sequence: &Sequence, output_path:
 
     let margin_pt = (sequence.margin_mm as f32) * (72.0 / 25.4); // mm 转 point (1 inch = 25.4mm = 72pt)
 
-    for item in &sequence.items {
-        let processed = match crate::img::process_image_bytes(
-            item.bytes.clone(),
-            sequence.jpeg_passthrough,
-            sequence.lossless_png,
-            sequence.quality,
-        ) {
-            Ok(img) => img,
-            Err(e) => {
-                eprintln!("⚠️ 跳过损坏图片 [{}]: {:?}", item.name, e);
-                continue;
-            }
-        };
+    // 分批多核并行转码 (每批 32 张，充分释放多核性能且将内存峰值严格控制在几十兆内)
+    const CHUNK_SIZE: usize = 32;
+
+    for chunk in sequence.items.chunks(CHUNK_SIZE) {
+        let processed_chunk: Vec<Result<crate::img::ProcessedImage>> = chunk
+            .par_iter()
+            .map(|item| {
+                crate::img::process_image_bytes(
+                    item.bytes.clone(),
+                    sequence.jpeg_passthrough,
+                    sequence.lossless_png,
+                    sequence.quality,
+                )
+            })
+            .collect();
+
+        for (item, res) in chunk.iter().zip(processed_chunk) {
+            let processed = match res {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("⚠️ 跳过损坏图片 [{}]: {:?}", item.name, e);
+                    continue;
+                }
+            };
 
         let page_id = Ref::new(next_id);
         next_id += 1;
@@ -107,6 +119,7 @@ pub fn build_pdf_from_sequence<P: AsRef<Path>>(sequence: &Sequence, output_path:
         page.finish();
 
         success_count += 1;
+        }
     }
 
     if page_ids.is_empty() {
