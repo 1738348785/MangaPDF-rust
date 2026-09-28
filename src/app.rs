@@ -1050,6 +1050,54 @@ impl eframe::App for MangaPdfApp {
                 self.show_about_dialog = false;
             }
         }
+
+        // 6. 拖拽文件悬停窗口时的高亮视觉反馈
+        let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if is_hovering_files {
+            let screen_rect = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("drag_and_drop_overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(screen_rect.min)
+                .show(ctx, |ui| {
+                    let overlay_fill = if is_dark {
+                        Color32::from_rgba_premultiplied(17, 24, 39, 220)
+                    } else {
+                        Color32::from_rgba_premultiplied(255, 255, 255, 230)
+                    };
+                    ui.painter().rect_filled(screen_rect, Rounding::ZERO, overlay_fill);
+
+                    let inner_rect = screen_rect.shrink(24.0);
+                    ui.painter().rect(
+                        inner_rect,
+                        Rounding::same(14.0),
+                        Color32::TRANSPARENT,
+                        Stroke::new(2.5_f32, primary_color),
+                    );
+
+                    let center = screen_rect.center();
+                    let text_sub = if is_dark {
+                        Color32::from_rgb(209, 213, 219)
+                    } else {
+                        Color32::from_rgb(75, 85, 99)
+                    };
+
+                    ui.painter().text(
+                        egui::pos2(center.x, center.y - 18.0),
+                        egui::Align2::CENTER_CENTER,
+                        "📂 释放鼠标以导入漫画与图片",
+                        FontId::proportional(22.0),
+                        primary_color,
+                    );
+
+                    ui.painter().text(
+                        egui::pos2(center.x, center.y + 18.0),
+                        egui::Align2::CENTER_CENTER,
+                        "支持文件夹、单张/多张图片、以及 .zip / .cbz 漫画归档包",
+                        FontId::proportional(13.0),
+                        text_sub,
+                    );
+                });
+        }
     }
 }
 
