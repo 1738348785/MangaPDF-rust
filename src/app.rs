@@ -580,7 +580,7 @@ impl eframe::App for MangaPdfApp {
 
                         ui.add_space(2.0);
                         ui.checkbox(&mut active_seq.lossless_direct, "保持原画无损直存 (100%原画)")
-                            .on_hover_text("保持图片原生画质（JPEG 零重编极速直存，PNG 原生 Flate 无损封装，零画质损失）");
+                            .on_hover_text("保留图片原始画质，不进行任何画质压缩，100% 还原原图");
 
                         ui.add_space(3.0);
                         ui.add_enabled_ui(!active_seq.lossless_direct, |ui| {
