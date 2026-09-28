@@ -22,7 +22,12 @@ pub fn build_pdf_from_sequence<P: AsRef<Path>>(sequence: &Sequence, output_path:
     let margin_pt = (sequence.margin_mm as f32) * (72.0 / 25.4); // mm 转 point (1 inch = 25.4mm = 72pt)
 
     for item in &sequence.items {
-        let processed = match crate::img::process_image_bytes(item.bytes.clone(), sequence.jpeg_passthrough, sequence.quality) {
+        let processed = match crate::img::process_image_bytes(
+            item.bytes.clone(),
+            sequence.jpeg_passthrough,
+            sequence.lossless_png,
+            sequence.quality,
+        ) {
             Ok(img) => img,
             Err(e) => {
                 eprintln!("⚠️ 跳过损坏图片 [{}]: {:?}", item.name, e);

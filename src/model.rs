@@ -44,6 +44,7 @@ pub struct Sequence {
     pub page_size_mode: PageSizeMode,
     pub quality: u8,
     pub jpeg_passthrough: bool,
+    pub lossless_png: bool,
     pub margin_mm: u32,
 }
 
@@ -75,6 +76,7 @@ impl Sequence {
             page_size_mode: PageSizeMode::Original,
             quality: 100, // 默认 100% 满画质
             jpeg_passthrough: true,
+            lossless_png: true, // 默认启用 PNG 无损
             margin_mm: 0,
         }
     }

@@ -28,6 +28,8 @@ pub struct MangaPdfApp {
     show_about_dialog: bool,
     last_output_path: Option<PathBuf>,
     scan_subfolders: bool,
+    app_logo_texture: Option<egui::TextureHandle>,
+    github_logo_texture: Option<egui::TextureHandle>,
 }
 
 enum TaskMessage {
@@ -58,7 +60,41 @@ impl MangaPdfApp {
             show_about_dialog: false,
             last_output_path: None,
             scan_subfolders: false,
+            app_logo_texture: None,
+            github_logo_texture: None,
         }
+    }
+
+    fn get_app_logo(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(tex) = &self.app_logo_texture {
+            return tex.clone();
+        }
+        let bytes = include_bytes!("../assets/icon.png");
+        let img = image::load_from_memory(bytes).expect("Failed to load icon.png").to_rgba8();
+        let (w, h) = img.dimensions();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize],
+            &img.into_raw(),
+        );
+        let tex = ctx.load_texture("app_logo_texture", color_image, egui::TextureOptions::LINEAR);
+        self.app_logo_texture = Some(tex.clone());
+        tex
+    }
+
+    fn get_github_logo(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(tex) = &self.github_logo_texture {
+            return tex.clone();
+        }
+        let bytes = include_bytes!("../assets/github.png");
+        let img = image::load_from_memory(bytes).expect("Failed to load github.png").to_rgba8();
+        let (w, h) = img.dimensions();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize],
+            &img.into_raw(),
+        );
+        let tex = ctx.load_texture("github_logo_texture", color_image, egui::TextureOptions::LINEAR);
+        self.github_logo_texture = Some(tex.clone());
+        tex
     }
 
     fn current_sequence_mut(&mut self) -> &mut Sequence {
@@ -370,6 +406,9 @@ impl eframe::App for MangaPdfApp {
         let text_muted = if is_dark { Color32::from_rgb(156, 163, 175) } else { Color32::from_rgb(107, 114, 128) };
         let primary_color = if is_dark { Color32::from_rgb(59, 130, 246) } else { Color32::from_rgb(37, 99, 235) };
 
+        let github_logo = self.get_github_logo(ctx);
+        let app_logo = self.get_app_logo(ctx);
+
         // 1. 顶部导航栏
         egui::TopBottomPanel::top("top_bar")
             .frame(egui::Frame::none().fill(card_bg).stroke(border_stroke).inner_margin(egui::Margin::symmetric(16.0, 10.0)))
@@ -526,18 +565,23 @@ impl eframe::App for MangaPdfApp {
                         });
 
                         ui.add_space(2.0);
-                        ui.checkbox(&mut active_seq.jpeg_passthrough, "JPEG 零重编直存 (100%原画)");
+                        ui.checkbox(&mut active_seq.jpeg_passthrough, "JPEG 零重编直存 (100%原画)")
+                            .on_hover_text("针对 JPEG 图片提取原始 DCT 数据流直接写入 PDF，极速且无任何画质损失");
+                        ui.checkbox(&mut active_seq.lossless_png, "PNG 原生无损封装 (Flate 零损失)")
+                            .on_hover_text("针对 PNG 图片采用 Deflate 无损压缩，保持 100% 像素级清晰度，杜绝 JPEG 杂色");
 
                         ui.add_space(3.0);
-                        // 开启 JPEG 直存时，滑块自动置灰禁用，杜绝逻辑冲突
-                        ui.add_enabled_ui(!active_seq.jpeg_passthrough, |ui| {
+                        let all_passthrough = active_seq.jpeg_passthrough && active_seq.lossless_png;
+                        ui.add_enabled_ui(!all_passthrough, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("压缩画质:").color(text_muted));
                                 ui.add(egui::Slider::new(&mut active_seq.quality, 10..=100).suffix("%"));
                             });
                         });
-                        if active_seq.jpeg_passthrough {
-                            ui.label(egui::RichText::new("💡 已启用直存，保持原图 100% 原始画质").font(FontId::proportional(10.0)).color(text_muted));
+                        if all_passthrough {
+                            ui.label(egui::RichText::new("💡 已启用全无损封装，保持原图 100% 原始画质").font(FontId::proportional(10.0)).color(text_muted));
+                        } else if active_seq.jpeg_passthrough {
+                            ui.label(egui::RichText::new("💡 JPEG 保持原画，其他图片按指定画质压缩").font(FontId::proportional(10.0)).color(text_muted));
                         }
 
                         ui.add_space(3.0);
@@ -895,19 +939,82 @@ impl eframe::App for MangaPdfApp {
 
         // 5. 关于对话框
         if self.show_about_dialog {
+            let github_url = "https://github.com/1738348785/MangaPDF-rust";
+            let mut close_dialog = false;
+
             egui::Window::new("关于 MangaPDF")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(380.0)
                 .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 7.0);
+
+                    // 顶部品牌区
                     ui.vertical_centered(|ui| {
+                        ui.add(
+                            egui::Image::new(&app_logo)
+                                .max_size(Vec2::splat(48.0))
+                                .rounding(Rounding::same(10.0))
+                        );
+                        ui.add_space(2.0);
                         ui.heading("MangaPDF 漫画与图片打包工具");
+                        ui.add_space(2.0);
                         ui.label(egui::RichText::new("版本 v1.0.0 · 现代轻量 GUI").color(text_muted));
+                        ui.add_space(4.0);
+
+                        // GitHub 小图标与小字转跳链接
+                        let label_text = "GitHub ↗";
+                        let font_id = FontId::proportional(12.0);
+                        let icon_size = 15.0;
+                        let gap = 5.0;
+                        let text_w = ui.fonts(|f| f.layout_no_wrap(label_text.to_string(), font_id.clone(), text_muted).size().x);
+                        let total_w = icon_size + gap + text_w;
+
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, 20.0), egui::Sense::click());
+                        let is_hovered = resp.hovered();
+                        let is_clicked = resp.clicked();
+                        resp.on_hover_text("在浏览器中打开 GitHub 开源仓库 ↗\nhttps://github.com/1738348785/MangaPDF-rust");
+
+                        if is_clicked {
+                            ctx.open_url(egui::OpenUrl::new_tab(github_url));
+                        }
+                        if is_hovered {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+
+                        let color = if is_hovered {
+                            primary_color
+                        } else {
+                            text_muted
+                        };
+
+                        let icon_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.min.x, rect.min.y + (rect.height() - icon_size) / 2.0),
+                            Vec2::splat(icon_size),
+                        );
+                        ui.painter().image(
+                            github_logo.id(),
+                            icon_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            color,
+                        );
+                        let text_pos = egui::pos2(
+                            rect.min.x + icon_size + gap,
+                            rect.min.y + (rect.height() - 14.0) / 2.0,
+                        );
+                        ui.painter().text(
+                            text_pos,
+                            egui::Align2::LEFT_TOP,
+                            label_text,
+                            font_id,
+                            color,
+                        );
                     });
 
-                    ui.add_space(10.0);
-                    ui.separator();
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
 
                     // 靠左整齐排列特性要点
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -921,11 +1028,18 @@ impl eframe::App for MangaPdfApp {
 
                     ui.add_space(14.0);
                     ui.vertical_centered(|ui| {
-                        if ui.add_sized([80.0, 28.0], egui::Button::new("确定")).clicked() {
-                            self.show_about_dialog = false;
+                        let confirm_btn = egui::Button::new(
+                            egui::RichText::new("确定").color(Color32::WHITE).strong()
+                        ).fill(primary_color);
+                        if ui.add_sized([80.0, 28.0], confirm_btn).clicked() {
+                            close_dialog = true;
                         }
                     });
                 });
+
+            if close_dialog {
+                self.show_about_dialog = false;
+            }
         }
     }
 }
