@@ -419,6 +419,7 @@ impl eframe::App for MangaPdfApp {
         let border_stroke = Stroke::new(1.0_f32, if is_dark { Color32::from_rgb(55, 65, 81) } else { Color32::from_rgb(229, 231, 235) });
         let text_muted = if is_dark { Color32::from_rgb(156, 163, 175) } else { Color32::from_rgb(107, 114, 128) };
         let primary_color = if is_dark { Color32::from_rgb(59, 130, 246) } else { Color32::from_rgb(37, 99, 235) };
+        let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
         let github_logo = self.get_github_logo(ctx);
         let app_logo = self.get_app_logo(ctx);
@@ -748,7 +749,9 @@ impl eframe::App for MangaPdfApp {
             let drop_height = 68.0;
             let (rect, response) = ui.allocate_exact_size(Vec2::new(drop_zone_rect.width(), drop_height), egui::Sense::click());
 
-            let drop_bg = if response.hovered() {
+            let is_drop_active = is_hovering_files || response.hovered();
+
+            let drop_bg = if is_drop_active {
                 if is_dark { Color32::from_rgb(30, 58, 138) } else { Color32::from_rgb(239, 246, 255) }
             } else if is_dark {
                 Color32::from_rgb(31, 41, 55)
@@ -756,7 +759,7 @@ impl eframe::App for MangaPdfApp {
                 Color32::WHITE
             };
 
-            let drop_border = if response.hovered() {
+            let drop_border = if is_drop_active {
                 primary_color
             } else if is_dark {
                 Color32::from_rgb(55, 65, 81)
@@ -764,18 +767,24 @@ impl eframe::App for MangaPdfApp {
                 Color32::from_rgb(209, 213, 219)
             };
 
+            let stroke_width = if is_drop_active { 2.0_f32 } else { 1.0_f32 };
             ui.painter().rect_filled(rect, 6.0, drop_bg);
-            ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0_f32, drop_border));
+            ui.painter().rect_stroke(rect, 6.0, Stroke::new(stroke_width, drop_border));
 
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(13.0);
+                    let title = if is_drop_active {
+                        "📥 释放鼠标立即导入漫画与图片"
+                    } else {
+                        "点击或将图片 / 文件夹 / CBZ 压缩包拖拽到此处"
+                    };
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("点击或将图片 / 文件夹 / CBZ 压缩包拖拽到此处")
+                            egui::RichText::new(title)
                                 .font(FontId::proportional(14.0))
                                 .strong()
-                                .color(if response.hovered() { primary_color } else { ui.visuals().text_color() }),
+                                .color(if is_drop_active { primary_color } else { ui.visuals().text_color() }),
                         )
                         .selectable(false)
                         .sense(egui::Sense::hover()),
@@ -1051,52 +1060,15 @@ impl eframe::App for MangaPdfApp {
             }
         }
 
-        // 6. 拖拽文件悬停窗口时的高亮视觉反馈
-        let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        // 6. 拖拽文件悬停窗口时的视觉高亮（仅在窗口边缘勾勒一圈精致的主题色描边，绝不遮挡用户界面）
         if is_hovering_files {
             let screen_rect = ctx.screen_rect();
-            egui::Area::new(egui::Id::new("drag_and_drop_overlay"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(screen_rect.min)
-                .show(ctx, |ui| {
-                    let overlay_fill = if is_dark {
-                        Color32::from_rgba_premultiplied(17, 24, 39, 220)
-                    } else {
-                        Color32::from_rgba_premultiplied(255, 255, 255, 230)
-                    };
-                    ui.painter().rect_filled(screen_rect, Rounding::ZERO, overlay_fill);
-
-                    let inner_rect = screen_rect.shrink(24.0);
-                    ui.painter().rect(
-                        inner_rect,
-                        Rounding::same(14.0),
-                        Color32::TRANSPARENT,
-                        Stroke::new(2.5_f32, primary_color),
-                    );
-
-                    let center = screen_rect.center();
-                    let text_sub = if is_dark {
-                        Color32::from_rgb(209, 213, 219)
-                    } else {
-                        Color32::from_rgb(75, 85, 99)
-                    };
-
-                    ui.painter().text(
-                        egui::pos2(center.x, center.y - 18.0),
-                        egui::Align2::CENTER_CENTER,
-                        "📂 释放鼠标以导入漫画与图片",
-                        FontId::proportional(22.0),
-                        primary_color,
-                    );
-
-                    ui.painter().text(
-                        egui::pos2(center.x, center.y + 18.0),
-                        egui::Align2::CENTER_CENTER,
-                        "支持文件夹、单张/多张图片、以及 .zip / .cbz 漫画归档包",
-                        FontId::proportional(13.0),
-                        text_sub,
-                    );
-                });
+            ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_drag_outline")))
+                .rect_stroke(
+                    screen_rect.shrink(1.0),
+                    Rounding::ZERO,
+                    Stroke::new(2.5_f32, primary_color),
+                );
         }
     }
 }
