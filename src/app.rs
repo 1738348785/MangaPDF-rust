@@ -900,84 +900,93 @@ impl eframe::App for MangaPdfApp {
                     ui.label(egui::RichText::new("暂无图片，请点击上方导入或直接拖入漫画文件").font(FontId::proportional(13.0)).color(text_muted));
                 });
             } else {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let card_w = 128.0;
-                    let available_w = ui.available_width();
-                    let cols = ((available_w / (card_w + 14.0)).floor() as usize).max(1);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let card_inner_w = 122.0;
+                        let card_margin = 8.0;
+                        let card_outer_w = card_inner_w + card_margin * 2.0; // 138.0
+                        let gap = 12.0;
+                        // 预留右侧滚动条空间（24px），严格杜绝右侧卡片被视口截断
+                        let avail_w = (ui.available_width() - 24.0).max(card_outer_w);
+                        let cols = ((avail_w + gap) / (card_outer_w + gap)).floor().max(1.0) as usize;
 
-                    let mut swap_action = None;
-                    let mut remove_action = None;
-                    let mut preview_action = None;
+                        let mut swap_action = None;
+                        let mut remove_action = None;
+                        let mut preview_action = None;
 
-                    egui::Grid::new("image_cards_grid")
-                        .spacing(Vec2::new(14.0, 16.0))
-                        .show(ui, |ui| {
-                            for (idx, item) in self.current_sequence().items.iter().enumerate() {
-                                egui::Frame::none()
-                                    .fill(card_bg)
-                                    .stroke(border_stroke)
-                                    .rounding(Rounding::same(6.0))
-                                    .inner_margin(egui::Margin::same(8.0))
-                                    .show(ui, |ui| {
-                                        ui.set_width(card_w);
-                                        ui.vertical_centered(|ui| {
-                                            let img_resp = if let Some(texture) = self.texture_cache.get(&item.id) {
-                                                let img_btn = egui::ImageButton::new((texture.id(), Vec2::new(112.0, 148.0)))
-                                                    .frame(false);
-                                                ui.add(img_btn)
-                                            } else {
-                                                ui.allocate_response(Vec2::new(112.0, 148.0), egui::Sense::click())
-                                            };
+                        egui::Grid::new("image_cards_grid")
+                            .spacing(Vec2::new(gap, 16.0))
+                            .show(ui, |ui| {
+                                for (idx, item) in self.current_sequence().items.iter().enumerate() {
+                                    egui::Frame::none()
+                                        .fill(card_bg)
+                                        .stroke(border_stroke)
+                                        .rounding(Rounding::same(6.0))
+                                        .inner_margin(egui::Margin::same(card_margin))
+                                        .show(ui, |ui| {
+                                            ui.set_width(card_inner_w);
+                                            ui.vertical_centered(|ui| {
+                                                let img_resp = if let Some(texture) = self.texture_cache.get(&item.id) {
+                                                    let img_btn = egui::ImageButton::new((texture.id(), Vec2::new(card_inner_w, 154.0)))
+                                                        .frame(false);
+                                                    ui.add(img_btn)
+                                                } else {
+                                                    ui.allocate_response(Vec2::new(card_inner_w, 154.0), egui::Sense::click())
+                                                };
 
-                                            let img_resp = img_resp.on_hover_text("🔍 点击放大预览此图片");
-                                            if img_resp.clicked() {
-                                                preview_action = Some(idx);
-                                            }
-
-                                            ui.add_space(4.0);
-
-                                            let display_name = if item.name.chars().count() > 14 {
-                                                format!("{}...", item.name.chars().take(12).collect::<String>())
-                                            } else {
-                                                item.name.clone()
-                                            };
-
-                                            ui.label(
-                                                egui::RichText::new(format!("#{}: {}", idx + 1, display_name))
-                                                    .font(FontId::proportional(11.0))
-                                                    .strong(),
-                                            );
-
-                                            ui.label(
-                                                egui::RichText::new(format!("{} × {}", item.width, item.height))
-                                                    .font(FontId::proportional(10.0))
-                                                    .color(text_muted),
-                                            );
-
-                                            ui.add_space(4.0);
-
-                                            ui.horizontal(|ui| {
-                                                if ui.small_button("◀").on_hover_text("前移").clicked() {
-                                                    swap_action = Some((idx, idx.saturating_sub(1)));
-                                                }
-                                                if ui.small_button("▶").on_hover_text("后移").clicked() {
-                                                    swap_action = Some((idx, idx + 1));
-                                                }
-                                                if ui.small_button("🔍").on_hover_text("放大预览").clicked() {
+                                                let img_resp = img_resp.on_hover_text("🔍 点击放大预览此图片");
+                                                if img_resp.clicked() {
                                                     preview_action = Some(idx);
                                                 }
-                                                if ui.small_button("×").on_hover_text("移除").clicked() {
-                                                    remove_action = Some(idx);
-                                                }
+
+                                                ui.add_space(4.0);
+
+                                                let display_name = if item.name.chars().count() > 14 {
+                                                    format!("{}...", item.name.chars().take(12).collect::<String>())
+                                                } else {
+                                                    item.name.clone()
+                                                };
+
+                                                ui.label(
+                                                    egui::RichText::new(format!("#{}: {}", idx + 1, display_name))
+                                                        .font(FontId::proportional(11.0))
+                                                        .strong(),
+                                                );
+
+                                                ui.label(
+                                                    egui::RichText::new(format!("{} × {}", item.width, item.height))
+                                                        .font(FontId::proportional(10.0))
+                                                        .color(text_muted),
+                                                );
+
+                                                ui.add_space(4.0);
+
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                                                    ui.spacing_mut().button_padding = Vec2::new(4.0, 3.0);
+
+                                                    if ui.add_sized([26.0, 22.0], egui::Button::new("◀")).on_hover_text("前移").clicked() {
+                                                        swap_action = Some((idx, idx.saturating_sub(1)));
+                                                    }
+                                                    if ui.add_sized([26.0, 22.0], egui::Button::new("▶")).on_hover_text("后移").clicked() {
+                                                        swap_action = Some((idx, idx + 1));
+                                                    }
+                                                    if ui.add_sized([26.0, 22.0], egui::Button::new("🔍")).on_hover_text("放大预览").clicked() {
+                                                        preview_action = Some(idx);
+                                                    }
+                                                    if ui.add_sized([26.0, 22.0], egui::Button::new("×")).on_hover_text("移除").clicked() {
+                                                        remove_action = Some(idx);
+                                                    }
+                                                });
                                             });
                                         });
-                                    });
 
-                                if (idx + 1) % cols == 0 {
-                                    ui.end_row();
+                                    if (idx + 1) % cols == 0 {
+                                        ui.end_row();
+                                    }
                                 }
-                            }
-                        });
+                            });
 
                     if let Some((from, to)) = swap_action {
                         let seq = self.current_sequence_mut();
