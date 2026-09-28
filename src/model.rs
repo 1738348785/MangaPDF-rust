@@ -43,8 +43,7 @@ pub struct Sequence {
     pub output_filename: String,
     pub page_size_mode: PageSizeMode,
     pub quality: u8,
-    pub jpeg_passthrough: bool,
-    pub lossless_png: bool,
+    pub lossless_direct: bool,
     pub margin_mm: u32,
 }
 
@@ -75,8 +74,7 @@ impl Sequence {
             output_filename,
             page_size_mode: PageSizeMode::Original,
             quality: 100, // 默认 100% 满画质
-            jpeg_passthrough: true,
-            lossless_png: true, // 默认启用 PNG 无损
+            lossless_direct: true, // 保持原画无损直存 (JPEG + PNG 全无损)
             margin_mm: 0,
         }
     }

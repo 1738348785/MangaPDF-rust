@@ -31,8 +31,7 @@ pub fn build_pdf_from_sequence<P: AsRef<Path>>(sequence: &Sequence, output_path:
             .map(|item| {
                 crate::img::process_image_bytes(
                     item.bytes.clone(),
-                    sequence.jpeg_passthrough,
-                    sequence.lossless_png,
+                    sequence.lossless_direct,
                     sequence.quality,
                 )
             })

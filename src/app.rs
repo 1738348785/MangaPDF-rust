@@ -565,23 +565,18 @@ impl eframe::App for MangaPdfApp {
                         });
 
                         ui.add_space(2.0);
-                        ui.checkbox(&mut active_seq.jpeg_passthrough, "JPEG 零重编直存 (100%原画)")
-                            .on_hover_text("针对 JPEG 图片提取原始 DCT 数据流直接写入 PDF，极速且无任何画质损失");
-                        ui.checkbox(&mut active_seq.lossless_png, "PNG 原生无损封装 (Flate 零损失)")
-                            .on_hover_text("针对 PNG 图片采用 Deflate 无损压缩，保持 100% 像素级清晰度，杜绝 JPEG 杂色");
+                        ui.checkbox(&mut active_seq.lossless_direct, "保持原画无损直存 (100%原画)")
+                            .on_hover_text("保持图片原生画质（JPEG 零重编极速直存，PNG 原生 Flate 无损封装，零画质损失）");
 
                         ui.add_space(3.0);
-                        let all_passthrough = active_seq.jpeg_passthrough && active_seq.lossless_png;
-                        ui.add_enabled_ui(!all_passthrough, |ui| {
+                        ui.add_enabled_ui(!active_seq.lossless_direct, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("压缩画质:").color(text_muted));
                                 ui.add(egui::Slider::new(&mut active_seq.quality, 10..=100).suffix("%"));
                             });
                         });
-                        if all_passthrough {
-                            ui.label(egui::RichText::new("💡 已启用全无损封装，保持原图 100% 原始画质").font(FontId::proportional(10.0)).color(text_muted));
-                        } else if active_seq.jpeg_passthrough {
-                            ui.label(egui::RichText::new("💡 JPEG 保持原画，其他图片按指定画质压缩").font(FontId::proportional(10.0)).color(text_muted));
+                        if active_seq.lossless_direct {
+                            ui.label(egui::RichText::new("💡 已启用原画无损直存，保持 100% 原始画质").font(FontId::proportional(10.0)).color(text_muted));
                         }
 
                         ui.add_space(3.0);

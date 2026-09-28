@@ -58,22 +58,23 @@ pub fn create_image_entry(id: usize, name: String, bytes: Vec<u8>) -> ImageEntry
     }
 }
 
-/// 解析并处理图片数据以供 PDF 组装 (支持 JPEG 直通、PNG 无损 Flate 或按指定画质 10%~100% 压缩重编)
+/// 解析并处理图片数据以供 PDF 组装 (支持原画无损直存：JPEG 零解码直通 + PNG Flate 无损；或按指定画质 10%~100% 压缩重编)
 pub fn process_image_bytes(
     bytes: Vec<u8>,
-    allow_jpeg_passthrough: bool,
-    allow_lossless_png: bool,
+    lossless_direct: bool,
     quality: u8,
 ) -> Result<ProcessedImage> {
-    if allow_jpeg_passthrough && is_jpeg(&bytes) {
-        if let Ok(processed) = parse_jpeg_passthrough(bytes.clone()) {
-            return Ok(processed);
+    if lossless_direct {
+        if is_jpeg(&bytes) {
+            if let Ok(processed) = parse_jpeg_passthrough(bytes.clone()) {
+                return Ok(processed);
+            }
         }
-    }
 
-    if allow_lossless_png && is_png(&bytes) {
-        if let Ok(processed) = decode_and_compress_flate(&bytes) {
-            return Ok(processed);
+        if is_png(&bytes) {
+            if let Ok(processed) = decode_and_compress_flate(&bytes) {
+                return Ok(processed);
+            }
         }
     }
 
