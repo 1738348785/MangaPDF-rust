@@ -768,6 +768,10 @@ impl eframe::App for MangaPdfApp {
                             ui.label(egui::RichText::new("mm (0为无边框)").font(FontId::proportional(11.0)).color(text_muted));
                         });
 
+                        ui.add_space(2.0);
+                        ui.checkbox(&mut active_seq.manga_rtl_spread, "日漫右翻跨页模式 (从右向左)")
+                            .on_hover_text("开启后写入 PDF 右翻跨页标记 (TwoPageRight + R2L)\n在 Acrobat / SumatraPDF 等专业阅读器中默认以日漫双页右翻排版打开");
+
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("分卷 / 输出文件名:").color(text_muted));
                         if ui.add(egui::TextEdit::singleline(&mut active_seq.output_filename).desired_width(242.0)).changed() {

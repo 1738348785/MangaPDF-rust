@@ -72,6 +72,7 @@ pub struct Sequence {
     pub quality: u8,
     pub lossless_direct: bool,
     pub margin_mm: u32,
+    pub manga_rtl_spread: bool,
 }
 
 pub fn default_desktop_dir() -> Option<PathBuf> {
@@ -103,6 +104,7 @@ impl Sequence {
             quality: 100, // 默认 100% 满画质
             lossless_direct: true, // 保持原画无损直存 (JPEG + PNG 全无损)
             margin_mm: 0,
+            manga_rtl_spread: false, // 默认关闭日漫右翻跨页模式
         }
     }
 

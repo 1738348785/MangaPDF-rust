@@ -156,7 +156,15 @@ where
     page_tree.finish();
 
     // 6. 写入 Catalog
-    pdf.catalog(catalog_id).pages(page_tree_id);
+    let mut catalog = pdf.catalog(catalog_id);
+    catalog.pages(page_tree_id);
+    if sequence.manga_rtl_spread {
+        catalog.page_layout(pdf_writer::types::PageLayout::TwoPageRight);
+        catalog
+            .viewer_preferences()
+            .direction(pdf_writer::types::Direction::R2L);
+    }
+    catalog.finish();
 
     let pdf_data = pdf.finish();
     if let Some(parent) = output_path.as_ref().parent() {
