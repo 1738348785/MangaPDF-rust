@@ -1208,7 +1208,7 @@ impl eframe::App for MangaPdfApp {
                         ui.add_space(2.0);
                         ui.heading("MangaPDF 漫画与图片打包工具");
                         ui.add_space(2.0);
-                        ui.label(egui::RichText::new("版本 v1.0.2 · 现代轻量 GUI").color(text_muted));
+                        ui.label(egui::RichText::new("版本 v1.0.3 · 现代轻量 GUI").color(text_muted));
                         ui.add_space(4.0);
 
                         // GitHub 小图标与小字转跳链接
@@ -1266,11 +1266,11 @@ impl eframe::App for MangaPdfApp {
 
                     // 靠左整齐排列特性要点
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        ui.label("• 高清画廊大图预览 (自适应窗口、1:1 原图与键盘快捷翻页)");
-                        ui.label("• 原画无损直存 (JPEG 直通 + PNG 原生无损保留)");
-                        ui.label("• 多核并行转码加速 (Rayon 线程池分批并发满载)");
-                        ui.label("• 智能全路径自然语义排序 (1.jpg -> 2.jpg -> 10.jpg)");
-                        ui.label("• 深度支持任意嵌套子文件夹扫描与多卷自动拆分");
+                        ui.label("• 高清画廊大图预览 (支持 8K 条漫、自适应窗口与键盘翻页)");
+                        ui.label("• 原画无损直存 (JPEG 零拷贝直通 + PNG 原生无损保留)");
+                        ui.label("• 全链路异步多核加速 (后台丝滑导入与分批并发打包)");
+                        ui.label("• 智能自然语义排序与右键快捷置顶/置底调序");
+                        ui.label("• 支持子文件夹递归扫描、多卷自动拆分与日漫右翻跨页");
                         ui.label("• 压缩画质动态重编 (10%~100% 自由可调)");
                         ui.label("• 页面尺寸无缝自适应 (消除黑边与留白)");
                         ui.label("• 纯本地静默生成 · 零依赖绿色运行");
