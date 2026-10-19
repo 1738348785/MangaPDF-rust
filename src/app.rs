@@ -1054,6 +1054,7 @@ impl eframe::App for MangaPdfApp {
                         let cols = ((avail_w + gap) / (card_outer_w + gap)).floor().max(1.0) as usize;
 
                         let mut swap_action = None;
+                        let mut move_to_action = None;
                         let mut remove_action = None;
                         let mut preview_action = None;
 
@@ -1077,10 +1078,29 @@ impl eframe::App for MangaPdfApp {
                                                     ui.allocate_response(Vec2::new(card_inner_w, 154.0), egui::Sense::click())
                                                 };
 
-                                                let img_resp = img_resp.on_hover_text("🔍 点击放大预览此图片");
+                                                let img_resp = img_resp.on_hover_text("🔍 左键点击放大预览 · 右键打开快捷菜单");
                                                 if img_resp.clicked() {
                                                     preview_action = Some(idx);
                                                 }
+                                                img_resp.context_menu(|ui| {
+                                                    if ui.add_enabled(idx > 0, egui::Button::new("⏫ 移至第一页 (设为封面)")).clicked() {
+                                                        move_to_action = Some((idx, 0));
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.add_enabled(idx + 1 < total_items, egui::Button::new("⏬ 移至最后一页")).clicked() {
+                                                        move_to_action = Some((idx, total_items.saturating_sub(1)));
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    if ui.button("🔍 放大预览").clicked() {
+                                                        preview_action = Some(idx);
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("🗑 移除此页").clicked() {
+                                                        remove_action = Some(idx);
+                                                        ui.close_menu();
+                                                    }
+                                                });
 
                                                 ui.add_space(4.0);
 
@@ -1134,6 +1154,14 @@ impl eframe::App for MangaPdfApp {
                         let seq = self.current_sequence_mut();
                         if to < seq.items.len() && from != to {
                             seq.items.swap(from, to);
+                        }
+                    }
+
+                    if let Some((from, to)) = move_to_action {
+                        let seq = self.current_sequence_mut();
+                        if from < seq.items.len() && to < seq.items.len() && from != to {
+                            let item = seq.items.remove(from);
+                            seq.items.insert(to, item);
                         }
                     }
 
@@ -1292,9 +1320,9 @@ impl eframe::App for MangaPdfApp {
                         .ok()
                         .and_then(|bytes| image::load_from_memory(&bytes).ok())
                         .map(|dyn_img| {
-                            let max_dim = 2560;
+                            let max_dim = 8192;
                             let img_to_show = if dyn_img.width() > max_dim || dyn_img.height() > max_dim {
-                                dyn_img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+                                dyn_img.resize(max_dim, max_dim, image::imageops::FilterType::CatmullRom)
                             } else {
                                 dyn_img
                             };
