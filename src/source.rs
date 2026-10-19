@@ -85,8 +85,15 @@ pub fn collect_image_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     files
 }
 
-/// 从文件路径列表中加载图片 (按自然语言自然排序)
-pub fn load_entries_from_paths(paths: &[PathBuf], mut start_id: usize) -> Vec<ImageEntry> {
+/// 从文件路径列表中加载图片 (按自然语言自然排序，支持分批并发与进度回调)
+pub fn load_entries_from_paths_with_progress<F>(
+    paths: &[PathBuf],
+    mut start_id: usize,
+    progress_cb: Option<&F>,
+) -> Vec<ImageEntry>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     let mut sorted_paths = paths.to_vec();
     sorted_paths.sort_by(|a, b| {
         let a_str = a.to_string_lossy();
@@ -109,19 +116,41 @@ pub fn load_entries_from_paths(paths: &[PathBuf], mut start_id: usize) -> Vec<Im
         })
         .collect();
 
-    raw_files
-        .into_par_iter()
-        .map(|(id, name, path)| {
-            let bytes = fs::read(&path).unwrap_or_default();
-            create_image_entry(id, name, bytes, Some(path))
-        })
-        .collect()
+    let total = raw_files.len();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let mut result = Vec::with_capacity(total);
+
+    for chunk in raw_files.chunks(32) {
+        let chunk_entries: Vec<ImageEntry> = chunk
+            .into_par_iter()
+            .map(|(id, name, path)| {
+                let bytes = fs::read(path).unwrap_or_default();
+                let entry = create_image_entry(*id, name.clone(), bytes, Some(path.clone()), None);
+                let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Some(cb) = progress_cb {
+                    cb(done, total, name);
+                }
+                entry
+            })
+            .collect();
+        result.extend(chunk_entries);
+    }
+
+    result
 }
 
-/// 从文件夹中加载所有图片 (可指定是否递归扫描)
-pub fn load_entries_from_folder(dir: &Path, start_id: usize, recursive: bool) -> Result<Vec<ImageEntry>> {
+/// 从文件夹中加载所有图片 (可指定是否递归扫描，支持进度回调)
+pub fn load_entries_from_folder_with_progress<F>(
+    dir: &Path,
+    start_id: usize,
+    recursive: bool,
+    progress_cb: Option<&F>,
+) -> Result<Vec<ImageEntry>>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     let file_paths = collect_image_files(dir, recursive);
-    Ok(load_entries_from_paths(&file_paths, start_id))
+    Ok(load_entries_from_paths_with_progress(&file_paths, start_id, progress_cb))
 }
 
 /// 检查目录是否包含多个直接分卷子目录
@@ -150,8 +179,15 @@ pub fn get_direct_subfolders(dir: &Path) -> Vec<PathBuf> {
     subfolders
 }
 
-/// 从 ZIP / CBZ 压缩包中读取图片
-pub fn load_entries_from_archive(archive_path: &Path, mut start_id: usize) -> Result<Vec<ImageEntry>> {
+/// 从 ZIP / CBZ 压缩包中分批读取图片生成缩略图（不常驻解压字节，严格控制峰值内存）
+pub fn load_entries_from_archive_with_progress<F>(
+    archive_path: &Path,
+    mut start_id: usize,
+    progress_cb: Option<&F>,
+) -> Result<Vec<ImageEntry>>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     let file = File::open(archive_path)
         .with_context(|| format!("无法打开压缩文件: {}", archive_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -175,25 +211,47 @@ pub fn load_entries_from_archive(archive_path: &Path, mut start_id: usize) -> Re
 
     valid_entries.sort_by(|a, b| natord::compare_ignore_case(&a.1, &b.1));
 
-    let mut raw_items = Vec::with_capacity(valid_entries.len());
-    for (index, name) in valid_entries {
-        let mut zip_file = archive.by_index(index)?;
-        let mut bytes = Vec::with_capacity(zip_file.size() as usize);
-        zip_file.read_to_end(&mut bytes)?;
-        let display_name = Path::new(&name)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let id = start_id;
-        start_id += 1;
-        raw_items.push((id, display_name, bytes));
-    }
+    let total = valid_entries.len();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let archive_arc = std::sync::Arc::new(archive_path.to_path_buf());
+    let mut entries = Vec::with_capacity(total);
 
-    let entries = raw_items
-        .into_par_iter()
-        .map(|(id, name, bytes)| create_image_entry(id, name, bytes, None))
-        .collect();
+    for chunk in valid_entries.chunks(32) {
+        let mut raw_chunk = Vec::with_capacity(chunk.len());
+        for (index, entry_name) in chunk {
+            let mut zip_file = archive.by_index(*index)?;
+            let mut bytes = Vec::with_capacity(zip_file.size() as usize);
+            zip_file.read_to_end(&mut bytes)?;
+            let display_name = Path::new(entry_name)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let id = start_id;
+            start_id += 1;
+            raw_chunk.push((id, display_name, entry_name.clone(), bytes));
+        }
+
+        let chunk_processed: Vec<ImageEntry> = raw_chunk
+            .into_par_iter()
+            .map(|(id, display_name, entry_name, bytes)| {
+                let entry = create_image_entry(
+                    id,
+                    display_name.clone(),
+                    bytes,
+                    None,
+                    Some((archive_arc.clone(), entry_name)),
+                );
+                let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Some(cb) = progress_cb {
+                    cb(done, total, &display_name);
+                }
+                entry
+            })
+            .collect();
+
+        entries.extend(chunk_processed);
+    }
 
     Ok(entries)
 }

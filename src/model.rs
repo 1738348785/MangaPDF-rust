@@ -1,4 +1,6 @@
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageSizeMode {
@@ -26,10 +28,11 @@ pub struct ImageEntry {
     pub id: usize,
     pub name: String,
     pub source_path: Option<PathBuf>,
-    pub bytes: Vec<u8>,
+    pub archive_source: Option<(Arc<PathBuf>, String)>,
+    pub bytes: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
-    pub thumb_rgb: Option<Vec<u8>>,
+    pub thumb_rgb: Option<Arc<[u8]>>,
     pub thumb_width: usize,
     pub thumb_height: usize,
 }
@@ -38,8 +41,21 @@ impl ImageEntry {
     pub fn get_bytes(&self) -> Result<Vec<u8>, String> {
         if let Some(path) = &self.source_path {
             std::fs::read(path).map_err(|e| format!("无法读取图片文件 {}: {}", path.display(), e))
+        } else if let Some((archive_path, entry_name)) = &self.archive_source {
+            let file = std::fs::File::open(archive_path.as_ref())
+                .map_err(|e| format!("无法打开归档文件 {}: {}", archive_path.display(), e))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| format!("无法解析归档 {}: {}", archive_path.display(), e))?;
+            let mut zip_file = archive
+                .by_name(entry_name)
+                .map_err(|e| format!("归档中找不到图片 {}: {}", entry_name, e))?;
+            let mut buf = Vec::with_capacity(zip_file.size() as usize);
+            zip_file
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("读取归档内图片 {} 失败: {}", entry_name, e))?;
+            Ok(buf)
         } else {
-            Ok(self.bytes.clone())
+            Ok(self.bytes.to_vec())
         }
     }
 }
@@ -92,20 +108,6 @@ impl Sequence {
 
     pub fn natural_sort(&mut self) {
         self.items.sort_by(|a, b| natord::compare_ignore_case(&a.name, &b.name));
-    }
-
-    #[allow(dead_code)]
-    pub fn move_up(&mut self, idx: usize) {
-        if idx > 0 && idx < self.items.len() {
-            self.items.swap(idx, idx - 1);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn move_down(&mut self, idx: usize) {
-        if idx + 1 < self.items.len() {
-            self.items.swap(idx, idx + 1);
-        }
     }
 
     pub fn remove_at(&mut self, idx: usize) {

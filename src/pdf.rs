@@ -84,6 +84,9 @@ where
             ColorSpace::DeviceCmyk => image_xobj.color_space().device_cmyk(),
         };
         image_xobj.bits_per_component(processed.bits_per_component as i32);
+        if processed.invert_cmyk {
+            image_xobj.decode([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        }
         match processed.filter {
             Filter::DctDecode => image_xobj.filter(PdfFilter::DctDecode),
             Filter::FlateDecode => image_xobj.filter(PdfFilter::FlateDecode),

@@ -145,11 +145,13 @@ fn main() -> anyhow::Result<()> {
         fs::create_dir_all(assets_dir)?;
     }
 
-    // Priority: icon2.png if exists, else original
-    let input_path = if assets_dir.join("icon2.png").exists() {
+    // Priority: CLI argument -> assets/icon2.png -> assets/icon.png
+    let input_path = if let Some(arg_path) = std::env::args_os().nth(1) {
+        std::path::PathBuf::from(arg_path)
+    } else if assets_dir.join("icon2.png").exists() {
         assets_dir.join("icon2.png")
     } else {
-        Path::new(r"C:\Users\1738348785\.gemini\antigravity\brain\89be20ae-147a-49a9-ac45-c1a4fae6fdb5\mangapdf_app_icon_1788030551238.jpg").to_path_buf()
+        assets_dir.join("icon.png")
     };
 
     println!("Processing: {}", input_path.display());

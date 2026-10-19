@@ -19,6 +19,7 @@ pub struct MangaPdfApp {
     is_dark_theme: bool,
     status_message: Option<(String, bool)>,
     is_generating: bool,
+    is_importing: bool,
     progress: f32,
     progress_text: String,
 
@@ -36,8 +37,15 @@ pub struct MangaPdfApp {
     preview_actual_size: bool,
 }
 
+struct ImportedGroup {
+    seq_name: Option<String>,
+    out_dir: Option<PathBuf>,
+    entries: Vec<ImageEntry>,
+}
+
 enum TaskMessage {
     Progress { current: usize, total: usize, desc: String },
+    ImportFinished { groups: Vec<ImportedGroup> },
     Finished { success_count: usize, output_path: PathBuf },
     BatchFinished {
         total_files: usize,
@@ -47,7 +55,7 @@ enum TaskMessage {
 }
 
 impl MangaPdfApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
         let initial_seq = Sequence::new(1, "第 01 卷".to_string());
 
@@ -60,6 +68,7 @@ impl MangaPdfApp {
             is_dark_theme: false,
             status_message: None,
             is_generating: false,
+            is_importing: false,
             progress: 0.0,
             progress_text: String::new(),
             task_receiver: rx,
@@ -74,6 +83,8 @@ impl MangaPdfApp {
             preview_texture: None,
             preview_actual_size: false,
         };
+
+        app.apply_modern_styling(&cc.egui_ctx);
 
         // 支持直接将漫画文件夹、图片或 .zip/.cbz 拖拽到 exe 图标启动
         let cli_paths: Vec<PathBuf> = std::env::args_os()
@@ -152,68 +163,117 @@ impl MangaPdfApp {
     }
 
     fn add_paths_to_current_sequence(&mut self, paths: Vec<PathBuf>) {
-        let scan_sub = self.scan_subfolders;
-        let final_paths = if scan_sub && paths.len() == 1 && paths[0].is_dir() {
-            let single_dir = &paths[0];
-            let subfolders = source::get_direct_subfolders(single_dir);
-            // 检查根目录下是否直接存在散落图片
-            let root_has_images = std::fs::read_dir(single_dir).map(|entries| {
-                entries.flatten().any(|e| {
-                    let p = e.path();
-                    p.is_file() && p.extension().and_then(|s| s.to_str()).map_or(false, source::is_image_extension)
-                })
-            }).unwrap_or(false);
+        if self.is_generating || self.is_importing || paths.is_empty() {
+            return;
+        }
 
-            if !root_has_images && subfolders.len() > 1 {
-                // 自动识别为整套漫画合集目录，拆分为多个独立分卷
-                subfolders
+        let scan_sub = self.scan_subfolders;
+        self.is_importing = true;
+        self.progress = 0.0;
+        self.progress_text = "正在扫描并导入图片...".to_string();
+        let tx = self.task_sender.clone();
+
+        thread::spawn(move || {
+            let final_paths = if scan_sub && paths.len() == 1 && paths[0].is_dir() {
+                let single_dir = &paths[0];
+                let subfolders = source::get_direct_subfolders(single_dir);
+                // 检查根目录下是否直接存在散落图片
+                let root_has_images = std::fs::read_dir(single_dir)
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            let p = e.path();
+                            p.is_file()
+                                && p.extension()
+                                    .and_then(|s| s.to_str())
+                                    .map_or(false, source::is_image_extension)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if !root_has_images && subfolders.len() > 1 {
+                    // 自动识别为整套漫画合集目录，拆分为多个独立分卷
+                    subfolders
+                } else {
+                    paths
+                }
             } else {
                 paths
-            }
-        } else {
-            paths
-        };
+            };
 
-        let mut loose_images = Vec::new();
+            let mut groups = Vec::new();
+            let mut loose_images = Vec::new();
 
-        for p in final_paths {
-            if source::is_archive(&p) {
-                let seq_name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                if let Ok(entries) = source::load_entries_from_archive(&p, self.next_image_id) {
-                    if !entries.is_empty() {
-                        self.next_image_id += entries.len() + 1;
-                        self.append_or_create_sequence(seq_name, p.parent().map(|d| d.to_path_buf()), entries);
+            for p in final_paths {
+                if source::is_archive(&p) {
+                    let seq_name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    let progress_tx = tx.clone();
+                    let label = seq_name.clone();
+                    let cb = move |current: usize, total: usize, name: &str| {
+                        let _ = progress_tx.send(TaskMessage::Progress {
+                            current,
+                            total,
+                            desc: format!("正在导入归档 {} [{}/{}]: {}", label, current, total, name),
+                        });
+                    };
+                    if let Ok(entries) = source::load_entries_from_archive_with_progress(&p, 0, Some(&cb)) {
+                        if !entries.is_empty() {
+                            groups.push(ImportedGroup {
+                                seq_name: Some(seq_name),
+                                out_dir: p.parent().map(|d| d.to_path_buf()),
+                                entries,
+                            });
+                        }
                     }
-                }
-            } else if p.is_dir() {
-                let seq_name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if let Ok(entries) = source::load_entries_from_folder(&p, self.next_image_id, scan_sub) {
-                    if !entries.is_empty() {
-                        self.next_image_id += entries.len() + 1;
-                        self.append_or_create_sequence(seq_name, p.parent().map(|d| d.to_path_buf()), entries);
+                } else if p.is_dir() {
+                    let seq_name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let progress_tx = tx.clone();
+                    let label = seq_name.clone();
+                    let cb = move |current: usize, total: usize, name: &str| {
+                        let _ = progress_tx.send(TaskMessage::Progress {
+                            current,
+                            total,
+                            desc: format!("正在导入文件夹 {} [{}/{}]: {}", label, current, total, name),
+                        });
+                    };
+                    if let Ok(entries) = source::load_entries_from_folder_with_progress(&p, 0, scan_sub, Some(&cb)) {
+                        if !entries.is_empty() {
+                            groups.push(ImportedGroup {
+                                seq_name: Some(seq_name),
+                                out_dir: p.parent().map(|d| d.to_path_buf()),
+                                entries,
+                            });
+                        }
                     }
+                } else {
+                    loose_images.push(p);
                 }
-            } else {
-                loose_images.push(p);
             }
-        }
 
-        if !loose_images.is_empty() {
-            let entries = source::load_entries_from_paths(&loose_images, self.next_image_id);
-            if !entries.is_empty() {
-                self.next_image_id += entries.len() + 1;
-                let current = self.current_sequence_mut();
-                if current.output_dir.is_none() {
-                    if let Some(first) = loose_images.first() {
-                        current.output_dir = first.parent().map(|d| d.to_path_buf());
-                    }
+            if !loose_images.is_empty() {
+                let progress_tx = tx.clone();
+                let cb = move |current: usize, total: usize, name: &str| {
+                    let _ = progress_tx.send(TaskMessage::Progress {
+                        current,
+                        total,
+                        desc: format!("正在导入图片 [{}/{}]: {}", current, total, name),
+                    });
+                };
+                let entries = source::load_entries_from_paths_with_progress(&loose_images, 0, Some(&cb));
+                if !entries.is_empty() {
+                    let out_dir = loose_images
+                        .first()
+                        .and_then(|first| first.parent())
+                        .map(|d| d.to_path_buf());
+                    groups.push(ImportedGroup {
+                        seq_name: None,
+                        out_dir,
+                        entries,
+                    });
                 }
-                current.items.extend(entries);
-                current.natural_sort();
             }
-        }
 
-        self.cleanup_stale_textures();
+            let _ = tx.send(TaskMessage::ImportFinished { groups });
+        });
     }
 
     fn append_or_create_sequence(&mut self, name: String, out_dir: Option<PathBuf>, entries: Vec<ImageEntry>) {
@@ -235,7 +295,7 @@ impl MangaPdfApp {
     }
 
     fn trigger_generate_current(&mut self) {
-        if self.is_generating {
+        if self.is_generating || self.is_importing {
             return;
         }
 
@@ -285,7 +345,7 @@ impl MangaPdfApp {
     }
 
     fn trigger_generate_all(&mut self) {
-        if self.is_generating {
+        if self.is_generating || self.is_importing {
             return;
         }
 
@@ -361,6 +421,37 @@ impl MangaPdfApp {
                     self.progress = current as f32 / total.max(1) as f32;
                     self.progress_text = desc;
                 }
+                TaskMessage::ImportFinished { groups } => {
+                    self.is_importing = false;
+                    self.progress = 1.0;
+                    let mut total_imported = 0usize;
+
+                    for mut group in groups {
+                        for entry in &mut group.entries {
+                            entry.id = self.next_image_id;
+                            self.next_image_id += 1;
+                        }
+                        total_imported += group.entries.len();
+
+                        if let Some(seq_name) = group.seq_name {
+                            self.append_or_create_sequence(seq_name, group.out_dir, group.entries);
+                        } else {
+                            let current = self.current_sequence_mut();
+                            if current.output_dir.is_none() {
+                                current.output_dir = group.out_dir;
+                            }
+                            current.items.extend(group.entries);
+                            current.natural_sort();
+                        }
+                    }
+
+                    if total_imported > 0 {
+                        self.status_message = Some((format!("已成功导入 {} 张图片", total_imported), false));
+                    } else {
+                        self.status_message = Some(("未在所选路径中找到有效图片".to_string(), true));
+                    }
+                    self.cleanup_stale_textures();
+                }
                 TaskMessage::Finished { success_count, output_path } => {
                     self.is_generating = false;
                     self.progress = 1.0;
@@ -403,6 +494,7 @@ impl MangaPdfApp {
                 }
                 TaskMessage::Error(err) => {
                     self.is_generating = false;
+                    self.is_importing = false;
                     self.status_message = Some((err, true));
                 }
             }
@@ -458,15 +550,15 @@ impl MangaPdfApp {
 impl eframe::App for MangaPdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_async_messages();
-        self.apply_modern_styling(ctx);
 
+        let is_busy = self.is_generating || self.is_importing;
         self.frame_count += 1;
         // 启动后第 3 帧（字体与显卡驱动着色器初始化上屏完毕），主动修剪工作集，交还显卡驱动预分配的大量非活跃内存
-        if self.frame_count == 3 || (self.frame_count % 300 == 0 && !self.is_generating) {
+        if self.frame_count == 3 || (self.frame_count % 300 == 0 && !is_busy) {
             trim_process_memory();
         }
 
-        if self.is_generating {
+        if is_busy {
             ctx.request_repaint();
         }
 
@@ -518,6 +610,7 @@ impl eframe::App for MangaPdfApp {
                         let theme_btn = if is_dark { "浅色模式" } else { "深色模式" };
                         if ui.button(theme_btn).clicked() {
                             self.is_dark_theme = !self.is_dark_theme;
+                            self.apply_modern_styling(ctx);
                         }
                     });
                 });
@@ -528,7 +621,7 @@ impl eframe::App for MangaPdfApp {
             .frame(egui::Frame::none().fill(card_bg).stroke(border_stroke).inner_margin(egui::Margin::symmetric(16.0, 7.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if self.is_generating {
+                    if is_busy {
                         ui.spinner();
                         ui.label(egui::RichText::new(&self.progress_text).color(primary_color).strong());
                         ui.add_space(10.0);
@@ -566,7 +659,7 @@ impl eframe::App for MangaPdfApp {
             .resizable(false)
             .frame(egui::Frame::none().fill(card_bg).stroke(border_stroke).inner_margin(egui::Margin::same(14.0)))
             .show(ctx, |ui| {
-                if self.is_generating {
+                if is_busy {
                     ui.disable();
                 }
                 ui.set_max_width(242.0);
@@ -705,6 +798,8 @@ impl eframe::App for MangaPdfApp {
                         // 主打包按钮
                         let (btn_text, btn_fill) = if self.is_generating {
                             ("⏳ 正在打包中...", Color32::from_rgb(156, 163, 175))
+                        } else if self.is_importing {
+                            ("⏳ 正在导入中...", Color32::from_rgb(156, 163, 175))
                         } else {
                             ("开始打包为 PDF", primary_color)
                         };
@@ -717,7 +812,7 @@ impl eframe::App for MangaPdfApp {
                         )
                         .fill(btn_fill);
 
-                        if ui.add_sized([242.0, 38.0], primary_btn).clicked() && !self.is_generating {
+                        if ui.add_sized([242.0, 38.0], primary_btn).clicked() && !is_busy {
                             self.trigger_generate_current();
                         }
 
@@ -729,7 +824,7 @@ impl eframe::App for MangaPdfApp {
                                     .font(FontId::proportional(12.0)),
                             );
 
-                            if ui.add_sized([242.0, 30.0], batch_btn).clicked() && !self.is_generating {
+                            if ui.add_sized([242.0, 30.0], batch_btn).clicked() && !is_busy {
                                 self.trigger_generate_all();
                             }
                         }
@@ -738,7 +833,7 @@ impl eframe::App for MangaPdfApp {
 
         // 4. 右侧中央主区域 (紧凑拖拽卡片 + 预览网格)
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.is_generating {
+            if is_busy {
                 ui.disable();
             }
             // 分卷标签栏
@@ -910,14 +1005,14 @@ impl eframe::App for MangaPdfApp {
 
             ui.add_space(10.0);
 
-            // 自动控容
-            if self.texture_cache.len() > 150 {
+            // 自动控容：仅当缓存超出 150 张且包含非当前分卷的残留纹理时才清理，避免单分卷超 150 页时每帧重复构建 HashSet
+            if self.texture_cache.len() > 150 && self.texture_cache.len() > total_items {
                 let active_ids: HashSet<usize> = self.current_sequence().items.iter().map(|i| i.id).collect();
                 self.texture_cache.retain(|id, _| active_ids.contains(id));
             }
 
             // 预加载当前可视所需的缩略图
-            let needed_textures: Vec<(usize, usize, usize, Vec<u8>)> = self
+            let needed_textures: Vec<(usize, usize, usize, std::sync::Arc<[u8]>)> = self
                 .current_sequence()
                 .items
                 .iter()
@@ -925,7 +1020,7 @@ impl eframe::App for MangaPdfApp {
                 .filter_map(|item| {
                     item.thumb_rgb
                         .as_ref()
-                        .map(|rgb| (item.id, item.thumb_width, item.thumb_height, rgb.clone()))
+                        .map(|rgb| (item.id, item.thumb_width, item.thumb_height, std::sync::Arc::clone(rgb)))
                 })
                 .collect();
 
