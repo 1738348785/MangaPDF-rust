@@ -550,6 +550,7 @@ impl MangaPdfApp {
 impl eframe::App for MangaPdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_async_messages();
+        self.apply_modern_styling(ctx);
 
         let is_busy = self.is_generating || self.is_importing;
         self.frame_count += 1;
