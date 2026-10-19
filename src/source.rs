@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const SUPPORTED_IMG_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "bmp", "jfif", "tif", "tiff",
+    "jpg", "jpeg", "png", "webp", "bmp", "jfif",
 ];
 
 pub const SUPPORTED_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "cbz"];

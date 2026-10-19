@@ -32,14 +32,17 @@ pub struct MangaPdfApp {
     github_logo_texture: Option<egui::TextureHandle>,
     frame_count: usize,
     preview_image_idx: Option<usize>,
-    preview_texture: Option<(usize, egui::TextureHandle)>,
+    preview_texture: Option<(usize, Option<egui::TextureHandle>)>,
     preview_actual_size: bool,
 }
 
 enum TaskMessage {
     Progress { current: usize, total: usize, desc: String },
     Finished { success_count: usize, output_path: PathBuf },
-    BatchFinished { total_files: usize },
+    BatchFinished {
+        total_files: usize,
+        failed_errors: Vec<String>,
+    },
     Error(String),
 }
 
@@ -48,7 +51,7 @@ impl MangaPdfApp {
         let (tx, rx) = channel();
         let initial_seq = Sequence::new(1, "第 01 卷".to_string());
 
-        Self {
+        let mut app = Self {
             sequences: vec![initial_seq],
             active_sequence_idx: 0,
             next_sequence_id: 2,
@@ -70,7 +73,19 @@ impl MangaPdfApp {
             preview_image_idx: None,
             preview_texture: None,
             preview_actual_size: false,
+        };
+
+        // 支持直接将漫画文件夹、图片或 .zip/.cbz 拖拽到 exe 图标启动
+        let cli_paths: Vec<PathBuf> = std::env::args_os()
+            .skip(1)
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .collect();
+        if !cli_paths.is_empty() {
+            app.add_paths_to_current_sequence(cli_paths);
         }
+
+        app
     }
 
     fn get_app_logo(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
@@ -263,7 +278,7 @@ impl MangaPdfApp {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(TaskMessage::Error(format!("生成失败: {:?}", e)));
+                    let _ = tx.send(TaskMessage::Error(format!("生成失败: {}", e)));
                 }
             }
         });
@@ -294,16 +309,21 @@ impl MangaPdfApp {
         thread::spawn(move || {
             let total_seqs = sequences.len();
             let mut success_total = 0;
+            let mut failed_errors = Vec::new();
+            let mut used_paths = HashSet::new();
 
             for (idx, seq) in sequences.into_iter().enumerate() {
                 let out_dir = seq.output_dir.clone().unwrap_or_else(|| PathBuf::from("."));
                 let safe_name = sanitize_filename(&seq.output_filename);
-                let pdf_name = if safe_name.ends_with(".pdf") {
-                    safe_name
-                } else {
-                    format!("{}.pdf", safe_name)
-                };
-                let final_path = out_dir.join(pdf_name);
+                let stem = safe_name.strip_suffix(".pdf").unwrap_or(&safe_name);
+                let mut final_path = out_dir.join(format!("{}.pdf", stem));
+
+                // 防止同批次多个分卷重名导致静默相互覆盖
+                let mut suffix_idx = 2usize;
+                while !used_paths.insert(final_path.to_string_lossy().to_ascii_lowercase()) {
+                    final_path = out_dir.join(format!("{}_{}.pdf", stem, suffix_idx));
+                    suffix_idx += 1;
+                }
 
                 let callback_tx = tx.clone();
                 let seq_name = seq.name.clone();
@@ -317,13 +337,19 @@ impl MangaPdfApp {
                     });
                 };
 
-                if let Ok(_) = crate::pdf::build_pdf_from_sequence(&seq, &final_path, Some(cb)) {
-                    success_total += 1;
+                match crate::pdf::build_pdf_from_sequence(&seq, &final_path, Some(cb)) {
+                    Ok(_) => {
+                        success_total += 1;
+                    }
+                    Err(e) => {
+                        failed_errors.push(format!("[{}] {}", seq.name, e));
+                    }
                 }
             }
 
             let _ = tx.send(TaskMessage::BatchFinished {
                 total_files: success_total,
+                failed_errors,
             });
         });
     }
@@ -345,14 +371,34 @@ impl MangaPdfApp {
                     ));
                     self.cleanup_stale_textures();
                 }
-                TaskMessage::BatchFinished { total_files } => {
+                TaskMessage::BatchFinished {
+                    total_files,
+                    failed_errors,
+                } => {
                     self.is_generating = false;
                     self.progress = 1.0;
                     self.last_output_path = self.current_sequence().output_dir.clone();
-                    self.status_message = Some((
-                        format!("完成！共成功生成 {} 个分卷 PDF 文件", total_files),
-                        false,
-                    ));
+                    if failed_errors.is_empty() {
+                        self.status_message = Some((
+                            format!("完成！共成功生成 {} 个分卷 PDF 文件", total_files),
+                            false,
+                        ));
+                    } else if total_files > 0 {
+                        self.status_message = Some((
+                            format!(
+                                "部分完成：成功 {} 个，失败 {} 个 ({})",
+                                total_files,
+                                failed_errors.len(),
+                                failed_errors.join("；")
+                            ),
+                            true,
+                        ));
+                    } else {
+                        self.status_message = Some((
+                            format!("批量生成失败：{}", failed_errors.join("；")),
+                            true,
+                        ));
+                    }
                     self.cleanup_stale_textures();
                 }
                 TaskMessage::Error(err) => {
@@ -565,7 +611,7 @@ impl eframe::App for MangaPdfApp {
                             }
                             if ui.add_sized([117.0, 30.0], egui::Button::new("选择图片文件")).clicked() {
                                 if let Some(files) = rfd::FileDialog::new()
-                                    .add_filter("图片文件", &["jpg", "jpeg", "png", "webp", "bmp"])
+                                    .add_filter("图片或漫画归档", &["jpg", "jpeg", "png", "webp", "bmp", "jfif", "zip", "cbz"])
                                     .pick_files()
                                 {
                                     self.add_paths_to_current_sequence(files);
@@ -836,7 +882,7 @@ impl eframe::App for MangaPdfApp {
 
             if response.clicked() {
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("图片或漫画归档", &["jpg", "jpeg", "png", "webp", "bmp", "zip", "cbz"])
+                    .add_filter("图片或漫画归档", &["jpg", "jpeg", "png", "webp", "bmp", "jfif", "zip", "cbz"])
                     .pick_files()
                 {
                     self.add_paths_to_current_sequence(files);
@@ -1120,28 +1166,36 @@ impl eframe::App for MangaPdfApp {
 
         // 5.5 图片大图预览浮窗 / 画廊查看器
         if let Some(cur_idx) = self.preview_image_idx {
+            let cached_id = self.preview_texture.as_ref().map(|(id, _)| *id);
             let page_info = {
                 let current_seq = self.current_sequence();
                 if cur_idx >= current_seq.items.len() {
                     None
                 } else {
                     let item = &current_seq.items[cur_idx];
+                    let bytes_res = if cached_id != Some(item.id) {
+                        Some(item.get_bytes())
+                    } else {
+                        None
+                    };
                     Some((
                         item.id,
                         item.name.clone(),
                         item.width,
                         item.height,
                         current_seq.items.len(),
-                        item.get_bytes(),
+                        bytes_res,
                     ))
                 }
             };
 
             if let Some((item_id, item_name, item_width, item_height, total_pages, bytes_res)) = page_info {
-                // 载入大图的高清渲染纹理 (若尚未缓存此图)
-                if self.preview_texture.as_ref().map(|(id, _)| *id) != Some(item_id) {
-                    if let Ok(bytes) = bytes_res {
-                        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                // 仅在切换图片或首次打开预览时读取并解码大图纹理，避免每帧重复读盘
+                if let Some(res) = bytes_res {
+                    let loaded_tex = res
+                        .ok()
+                        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                        .map(|dyn_img| {
                             let max_dim = 2560;
                             let img_to_show = if dyn_img.width() > max_dim || dyn_img.height() > max_dim {
                                 dyn_img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
@@ -1153,14 +1207,13 @@ impl eframe::App for MangaPdfApp {
                                 [rgba.width() as usize, rgba.height() as usize],
                                 &rgba,
                             );
-                            let tex = ctx.load_texture(
+                            ctx.load_texture(
                                 "large_preview_texture",
                                 color_img,
                                 egui::TextureOptions::LINEAR,
-                            );
-                            self.preview_texture = Some((item_id, tex));
-                        }
-                    }
+                            )
+                        });
+                    self.preview_texture = Some((item_id, loaded_tex));
                 }
 
                 let mut close_preview = false;
@@ -1228,7 +1281,7 @@ impl eframe::App for MangaPdfApp {
                         ui.separator();
 
                         // 图片展示区：平滑居中自适应缩放
-                        if let Some((_, tex)) = &self.preview_texture {
+                        if let Some((_, Some(tex))) = &self.preview_texture {
                             if self.preview_actual_size {
                                 egui::ScrollArea::both()
                                     .auto_shrink([false, false])
@@ -1265,7 +1318,7 @@ impl eframe::App for MangaPdfApp {
                             }
                         } else {
                             ui.centered_and_justified(|ui| {
-                                ui.label("正在加载大图预览...");
+                                ui.label("无法加载该图片预览");
                             });
                         }
                     });

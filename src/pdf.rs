@@ -111,9 +111,11 @@ where
             }
             PageSizeMode::FixedRatio => {
                 let target_w = 1200.0_f32;
-                let scale = target_w / processed.width;
-                let ph = processed.height * scale;
-                (target_w, ph, target_w, ph, 0.0, 0.0)
+                let avail_w = (target_w - margin_pt * 2.0).max(10.0);
+                let scale = avail_w / processed.width.max(1.0);
+                let dh = processed.height * scale;
+                let ph = dh + margin_pt * 2.0;
+                (target_w, ph, avail_w, dh, margin_pt, margin_pt)
             }
         };
 
