@@ -4,8 +4,6 @@ Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host "  MangaPDF - Release Build Script" -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
 
-$env:PATH = "D:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-
 Write-Host "`n[1/2] Building release binary with icon resource..." -ForegroundColor Yellow
 cargo build --release
 
