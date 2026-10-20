@@ -77,6 +77,27 @@ enum TaskMessage {
     Error(String),
 }
 
+/// 启动后台任务线程，并捕获其中的 panic (例如畸形图片导致解码器崩溃)。
+/// 发生 panic 时发送 `TaskMessage::Error`，确保界面能复位 is_generating / is_importing，不会永久卡住。
+fn spawn_guarded<F>(tx: Sender<TaskMessage>, task_label: &'static str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::spawn(move || {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知错误".to_string());
+            let _ = tx.send(TaskMessage::Error(format!(
+                "{}过程中发生内部错误，任务已中止：{}",
+                task_label, reason
+            )));
+        }
+    });
+}
+
 impl MangaPdfApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
@@ -210,7 +231,7 @@ impl MangaPdfApp {
         self.progress_text = "正在扫描并导入图片...".to_string();
         let tx = self.task_sender.clone();
 
-        thread::spawn(move || {
+        spawn_guarded(tx.clone(), "导入", move || {
             let final_paths = if scan_sub && paths.len() == 1 && paths[0].is_dir() {
                 let single_dir = &paths[0];
                 let subfolders = source::get_direct_subfolders(single_dir);
@@ -429,7 +450,7 @@ impl MangaPdfApp {
         self.progress_text = format!("正在生成: {}", final_path.display());
         let tx = self.task_sender.clone();
 
-        thread::spawn(move || {
+        spawn_guarded(tx.clone(), "生成", move || {
             let callback_tx = tx.clone();
             let cb = move |current: usize, total: usize, name: &str| {
                 let percent = (current as f32 / total.max(1) as f32) * 100.0;
@@ -480,7 +501,7 @@ impl MangaPdfApp {
         self.progress_text = format!("批量处理 {} 个分卷中...", sequences.len());
         let tx = self.task_sender.clone();
 
-        thread::spawn(move || {
+        spawn_guarded(tx.clone(), "批量生成", move || {
             let total_seqs = sequences.len();
             let mut success_total = 0;
             let mut failed_errors = Vec::new();
