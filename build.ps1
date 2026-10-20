@@ -13,6 +13,8 @@ if ($LASTEXITCODE -eq 0) {
     Start-Sleep -Milliseconds 300
     Copy-Item "target\release\pdf_tool.exe" "MangaPDF.exe" -Force
     Copy-Item "target\release\pdf_tool.exe" "MangaPDF-rust.exe" -Force
+    icacls "MangaPDF.exe" /setintegritylevel Medium | Out-Null
+    icacls "MangaPDF-rust.exe" /setintegritylevel Medium | Out-Null
     if (Test-Path "pdf_tool.exe") {
         Remove-Item "pdf_tool.exe" -Force
     }

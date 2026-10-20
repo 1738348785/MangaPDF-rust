@@ -298,69 +298,17 @@ fn parse_jpeg_header(data: &[u8]) -> Result<JpegInfo> {
     anyhow::bail!("无法在 JPEG 中解析到有效的 SOF Marker")
 }
 
-fn decode_and_compress_with_quality(bytes: &[u8], quality: u8) -> Result<ProcessedImage> {
-    let dynamic_img = decode_oriented(bytes)?;
-
-    let width = dynamic_img.width() as f32;
-    let height = dynamic_img.height() as f32;
-    let q = quality.clamp(10, 100);
-    let mut jpeg_buf = Vec::new();
-
+/// 将解码后的图像统一转换为无透明通道的 8-bit 灰度或 RGB 像素缓冲 (透明像素与纯白背景 255 混合)
+fn flatten_to_white(dynamic_img: image::DynamicImage) -> (ColorSpace, Vec<u8>) {
+    let width = dynamic_img.width() as usize;
+    let height = dynamic_img.height() as usize;
     match dynamic_img.color() {
-        image::ColorType::L8 => {
-            let luma = dynamic_img.into_luma8();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, q);
-            encoder.encode(
-                luma.as_raw(),
-                width as u32,
-                height as u32,
-                image::ExtendedColorType::L8,
-            )?;
-            Ok(ProcessedImage {
-                width,
-                height,
-                color_space: ColorSpace::DeviceGray,
-                bits_per_component: 8,
-                filter: Filter::DctDecode,
-                stream_data: jpeg_buf,
-                invert_cmyk: false,
-                orientation: 1,
-            })
+        image::ColorType::L8 | image::ColorType::L16 => {
+            (ColorSpace::DeviceGray, dynamic_img.into_luma8().into_raw())
         }
-        _ => {
-            let rgb = dynamic_img.into_rgb8();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, q);
-            encoder.encode(
-                rgb.as_raw(),
-                width as u32,
-                height as u32,
-                image::ExtendedColorType::Rgb8,
-            )?;
-            Ok(ProcessedImage {
-                width,
-                height,
-                color_space: ColorSpace::DeviceRgb,
-                bits_per_component: 8,
-                filter: Filter::DctDecode,
-                stream_data: jpeg_buf,
-                invert_cmyk: false,
-                orientation: 1,
-            })
-        }
-    }
-}
-
-pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
-    let dynamic_img = decode_oriented(bytes)?;
-
-    let width = dynamic_img.width() as f32;
-    let height = dynamic_img.height() as f32;
-
-    let (color_space, raw_pixels) = match dynamic_img.color() {
-        image::ColorType::L8 => (ColorSpace::DeviceGray, dynamic_img.into_luma8().into_raw()),
-        image::ColorType::La8 => {
+        image::ColorType::La8 | image::ColorType::La16 => {
             let luma_a = dynamic_img.into_luma_alpha8();
-            let mut luma = Vec::with_capacity((width * height) as usize);
+            let mut luma = Vec::with_capacity(width * height);
             for pixel in luma_a.pixels() {
                 let l = pixel[0] as u32;
                 let a = pixel[1] as u32;
@@ -369,9 +317,9 @@ pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
             }
             (ColorSpace::DeviceGray, luma)
         }
-        image::ColorType::Rgba8 => {
+        image::ColorType::Rgba8 | image::ColorType::Rgba16 => {
             let rgba = dynamic_img.into_rgba8();
-            let mut rgb = Vec::with_capacity((width * height * 3.0) as usize);
+            let mut rgb = Vec::with_capacity(width * height * 3);
             for pixel in rgba.pixels() {
                 let a = pixel[3] as u32;
                 if a == 255 {
@@ -394,7 +342,43 @@ pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
             (ColorSpace::DeviceRgb, rgb)
         }
         _ => (ColorSpace::DeviceRgb, dynamic_img.into_rgb8().into_raw()),
+    }
+}
+
+fn decode_and_compress_with_quality(bytes: &[u8], quality: u8) -> Result<ProcessedImage> {
+    let dynamic_img = decode_oriented(bytes)?;
+
+    let width = dynamic_img.width() as f32;
+    let height = dynamic_img.height() as f32;
+    let q = quality.clamp(10, 100);
+    let mut jpeg_buf = Vec::new();
+
+    let (color_space, raw_pixels) = flatten_to_white(dynamic_img);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, q);
+    let ext_color = match color_space {
+        ColorSpace::DeviceGray => image::ExtendedColorType::L8,
+        _ => image::ExtendedColorType::Rgb8,
     };
+    encoder.encode(&raw_pixels, width as u32, height as u32, ext_color)?;
+
+    Ok(ProcessedImage {
+        width,
+        height,
+        color_space,
+        bits_per_component: 8,
+        filter: Filter::DctDecode,
+        stream_data: jpeg_buf,
+        invert_cmyk: false,
+        orientation: 1,
+    })
+}
+
+pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
+    let dynamic_img = decode_oriented(bytes)?;
+
+    let width = dynamic_img.width() as f32;
+    let height = dynamic_img.height() as f32;
+    let (color_space, raw_pixels) = flatten_to_white(dynamic_img);
 
     let stream_data = miniz_oxide::deflate::compress_to_vec_zlib(&raw_pixels, 6);
 

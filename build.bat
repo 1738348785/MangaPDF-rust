@@ -6,6 +6,8 @@ cargo build --release
 if %ERRORLEVEL% equ 0 (
     copy /y "target\release\pdf_tool.exe" "MangaPDF.exe"
     copy /y "target\release\pdf_tool.exe" "MangaPDF-rust.exe"
+    icacls "MangaPDF.exe" /setintegritylevel Medium >nul 2>&1
+    icacls "MangaPDF-rust.exe" /setintegritylevel Medium >nul 2>&1
     if exist "pdf_tool.exe" del /f /q "pdf_tool.exe"
     echo [MangaPDF] Build Succeeded: MangaPDF.exe and MangaPDF-rust.exe are ready!
 ) else (

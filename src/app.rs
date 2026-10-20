@@ -390,6 +390,14 @@ impl MangaPdfApp {
 
         // 若目标 PDF 文件已存在，弹出系统确认框防止误覆盖原文件
         if final_path.exists() {
+            if final_path.is_dir() {
+                self.set_status(
+                    format!("生成失败：目标路径 \"{}\" 是一个已存在的文件夹", final_path.display()),
+                    true,
+                    Vec::new(),
+                );
+                return;
+            }
             let confirm = rfd::MessageDialog::new()
                 .set_title("PDF 文件已存在")
                 .set_description(format!(
@@ -399,6 +407,19 @@ impl MangaPdfApp {
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .show();
             if confirm != rfd::MessageDialogResult::Yes {
+                return;
+            }
+            // 提前检测目标文件是否被阅读器锁住或无权写入，避免白跑转码流程
+            if let Err(e) = std::fs::OpenOptions::new().write(true).open(&final_path) {
+                self.set_status(
+                    format!(
+                        "生成失败：无法覆盖 \"{}\"：{}（请检查该 PDF 是否正被阅读器打开占用）",
+                        final_path.display(),
+                        e
+                    ),
+                    true,
+                    Vec::new(),
+                );
                 return;
             }
         }
@@ -561,7 +582,9 @@ impl MangaPdfApp {
                             self.append_or_create_sequence(seq_name, group.out_dir, group.entries);
                         } else {
                             let current = self.current_sequence_mut();
-                            if current.output_dir.is_none() {
+                            if (current.items.is_empty() || current.output_dir.is_none())
+                                && group.out_dir.is_some()
+                            {
                                 current.output_dir = group.out_dir;
                             }
                             current.items.extend(group.entries);

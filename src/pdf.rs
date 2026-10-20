@@ -302,12 +302,27 @@ where
     catalog.finish();
 
     let pdf_data = pdf.finish();
-    if let Some(parent) = output_path.as_ref().parent() {
-        std::fs::create_dir_all(parent)?;
+    let out_path = output_path.as_ref();
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("无法创建输出目录 \"{}\"：{}", parent.display(), e)
+            })?;
+        }
     }
 
-    let mut file = File::create(output_path)?;
-    file.write_all(&pdf_data)?;
+    let mut file = File::create(out_path).map_err(|e| {
+        let hint = if out_path.is_dir() {
+            "（目标路径是一个已存在的文件夹）"
+        } else if matches!(e.raw_os_error(), Some(5) | Some(32)) {
+            "（请检查同名 PDF 是否正被阅读器打开占用，或输出目录是否有写入权限）"
+        } else {
+            ""
+        };
+        anyhow::anyhow!("无法写入 \"{}\"：{}{}", out_path.display(), e, hint)
+    })?;
+    file.write_all(&pdf_data)
+        .map_err(|e| anyhow::anyhow!("写入 PDF 数据失败 \"{}\"：{}", out_path.display(), e))?;
 
     Ok(BuildReport {
         pages: success_count,
