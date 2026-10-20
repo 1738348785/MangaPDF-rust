@@ -903,187 +903,246 @@ impl MangaPdfApp {
                 }
                 ui.set_max_width(242.0);
 
-                let total_pages = self.current_sequence().items.len();
-                let seq_name = self.current_sequence().name.clone();
-
-                egui::Frame::none()
-                    .fill(if theme.is_dark {
-                        Color32::from_rgb(17, 24, 39)
-                    } else {
-                        Color32::from_rgb(243, 244, 246)
-                    })
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_max_width(218.0);
-                        ui.label(
-                            egui::RichText::new(format!("共 {} 页", total_pages))
-                                .font(FontId::proportional(22.0))
-                                .strong()
-                                .color(theme.primary_color),
-                        );
+                        ui.set_max_width(242.0);
+                        let total_pages = self.current_sequence().items.len();
+                        let seq_name = self.current_sequence().name.clone();
 
-                        let short_name = if seq_name.chars().count() > 18 {
-                            format!("{}...", seq_name.chars().take(16).collect::<String>())
-                        } else {
-                            seq_name
-                        };
-                        ui.label(
-                            egui::RichText::new(format!("分卷: {}", short_name))
-                                .font(FontId::proportional(11.0))
-                                .color(theme.text_muted),
-                        );
-                    });
-
-                ui.add_space(8.0);
-
-                // 快捷导入操作（紧凑 2 按钮排布）
-                ui.horizontal(|ui| {
-                    if ui.add_sized([117.0, 30.0], egui::Button::new("导入文件夹")).clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.add_paths_to_current_sequence(vec![folder]);
-                        }
-                    }
-                    if ui.add_sized([117.0, 30.0], egui::Button::new("选择图片文件")).clicked() {
-                        if let Some(files) = rfd::FileDialog::new()
-                            .add_filter(
-                                "图片或漫画归档",
-                                &["jpg", "jpeg", "png", "webp", "bmp", "jfif", "zip", "cbz"],
-                            )
-                            .pick_files()
-                        {
-                            self.add_paths_to_current_sequence(files);
-                        }
-                    }
-                });
-
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.scan_subfolders, "包含子文件夹图片");
-                })
-                .response
-                .on_hover_text(
-                    "开启：导入时递归扫描子文件夹内全部图片\n关闭：仅导入根目录下的一级图片（自动忽略蒙版/翻译缓存等子目录）",
-                );
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                // 输出设置
-                ui.label(egui::RichText::new("输出配置").font(FontId::proportional(13.0)).strong());
-                ui.add_space(4.0);
-
-                let active_seq = self.current_sequence_mut();
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("页面模式:").color(theme.text_muted));
-                    egui::ComboBox::from_id_salt("page_mode_combo")
-                        .selected_text(active_seq.page_size_mode.label())
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for mode in PageSizeMode::all() {
-                                ui.selectable_value(
-                                    &mut active_seq.page_size_mode,
-                                    *mode,
-                                    mode.label(),
+                        // 头部统计卡片
+                        egui::Frame::none()
+                            .fill(if theme.is_dark {
+                                Color32::from_rgb(17, 24, 39)
+                            } else {
+                                Color32::from_rgb(243, 244, 246)
+                            })
+                            .rounding(Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(218.0);
+                                ui.set_max_width(218.0);
+                                ui.label(
+                                    egui::RichText::new(format!("共 {} 页", total_pages))
+                                        .font(FontId::proportional(22.0))
+                                        .strong()
+                                        .color(theme.primary_color),
                                 );
+
+                                let short_name = if seq_name.chars().count() > 18 {
+                                    format!("{}...", seq_name.chars().take(16).collect::<String>())
+                                } else {
+                                    seq_name
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("分卷: {}", short_name))
+                                        .font(FontId::proportional(11.0))
+                                        .color(theme.text_muted),
+                                );
+                            });
+
+                        ui.add_space(8.0);
+
+                        // 快捷导入操作（紧凑 2 按钮排布）
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized([117.0, 30.0], egui::Button::new("导入文件夹"))
+                                .clicked()
+                            {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    self.add_paths_to_current_sequence(vec![folder]);
+                                }
+                            }
+                            if ui
+                                .add_sized([117.0, 30.0], egui::Button::new("选择图片文件"))
+                                .clicked()
+                            {
+                                if let Some(files) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "图片或漫画归档",
+                                        &[
+                                            "jpg", "jpeg", "png", "webp", "bmp", "jfif", "zip",
+                                            "cbz",
+                                        ],
+                                    )
+                                    .pick_files()
+                                {
+                                    self.add_paths_to_current_sequence(files);
+                                }
                             }
                         });
-                });
 
-                ui.add_space(2.0);
-                ui.checkbox(&mut active_seq.lossless_direct, "保持原画无损直存 (100%原画)")
-                    .on_hover_text("保留图片原始画质，不进行任何画质压缩，100% 还原原图");
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.scan_subfolders, "包含子文件夹图片");
+                        })
+                        .response
+                        .on_hover_text(
+                            "开启：导入时递归扫描子文件夹内全部图片\n关闭：仅导入根目录下的一级图片（自动忽略蒙版/翻译缓存等子目录）",
+                        );
 
-                if !active_seq.lossless_direct {
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("压缩画质:").color(theme.text_muted));
-                        ui.add(egui::Slider::new(&mut active_seq.quality, 10..=100).text("%"));
-                    });
-                }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(6.0);
 
-                ui.add_space(2.0);
-                ui.checkbox(&mut active_seq.manga_rtl_spread, "日漫右翻跨页模式 (右向左)")
-                    .on_hover_text(
-                        "专为日漫双页跨页阅读设计：\n• 设置 PDF 翻页顺序为从右向左 (Right-to-Left)\n• 默认启用双页并排显示，第 1 页作为独立封面靠右展示",
-                    );
+                        // 输出设置
+                        ui.label(
+                            egui::RichText::new("输出配置")
+                                .font(FontId::proportional(13.0))
+                                .strong(),
+                        );
+                        ui.add_space(4.0);
 
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("页边间距:").color(theme.text_muted));
-                    ui.add(egui::Slider::new(&mut active_seq.margin_mm, 0..=30).text("mm"));
-                });
+                        let active_seq = self.current_sequence_mut();
 
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("分卷重命名:").color(theme.text_muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut active_seq.output_filename)
-                        .desired_width(242.0),
-                );
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("页面模式:").color(theme.text_muted));
+                            egui::ComboBox::from_id_salt("page_mode_combo")
+                                .selected_text(active_seq.page_size_mode.label())
+                                .width(160.0)
+                                .show_ui(ui, |ui| {
+                                    for mode in PageSizeMode::all() {
+                                        ui.selectable_value(
+                                            &mut active_seq.page_size_mode,
+                                            *mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                        });
 
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("导出目录:").color(theme.text_muted));
-                ui.horizontal(|ui| {
-                    let mut dir_str = active_seq
-                        .output_dir
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut dir_str).desired_width(185.0))
-                        .changed()
-                    {
-                        active_seq.output_dir = Some(PathBuf::from(dir_str));
-                    }
-                    if ui.add_sized([45.0, 22.0], egui::Button::new("浏览")).clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            active_seq.output_dir = Some(folder);
+                        ui.add_space(2.0);
+                        ui.checkbox(
+                            &mut active_seq.lossless_direct,
+                            "保持原画无损直存 (100%原画)",
+                        )
+                        .on_hover_text("保留图片原始画质，不进行任何画质压缩，100% 还原原图");
+
+                        ui.add_space(3.0);
+                        ui.add_enabled_ui(!active_seq.lossless_direct, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("压缩画质:").color(theme.text_muted));
+                                ui.add(
+                                    egui::Slider::new(&mut active_seq.quality, 10..=100)
+                                        .suffix("%"),
+                                );
+                            });
+                        });
+                        if active_seq.lossless_direct {
+                            ui.label(
+                                egui::RichText::new("💡 已启用原画无损直存，保持 100% 原始画质")
+                                    .font(FontId::proportional(10.0))
+                                    .color(theme.text_muted),
+                            );
                         }
-                    }
-                });
 
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(8.0);
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("页面边距:").color(theme.text_muted));
+                            let mut margin_str = active_seq.margin_mm.to_string();
+                            let resp = ui.add_sized(
+                                [56.0, 22.0],
+                                egui::TextEdit::singleline(&mut margin_str),
+                            );
+                            if resp.changed() {
+                                if let Ok(val) = margin_str.parse::<u32>() {
+                                    active_seq.margin_mm = val;
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new("mm (0为无边框)")
+                                    .font(FontId::proportional(11.0))
+                                    .color(theme.text_muted),
+                            );
+                        });
 
-                // 主打包按钮
-                let (btn_text, btn_fill) = if self.is_generating {
-                    ("⏳ 正在打包中...", Color32::from_rgb(156, 163, 175))
-                } else if self.is_importing {
-                    ("⏳ 正在导入中...", Color32::from_rgb(156, 163, 175))
-                } else {
-                    ("开始打包为 PDF", theme.primary_color)
-                };
+                        ui.add_space(2.0);
+                        ui.checkbox(
+                            &mut active_seq.manga_rtl_spread,
+                            "日漫右翻跨页模式 (从右向左)",
+                        )
+                        .on_hover_text(
+                            "开启后写入 PDF 右翻跨页标记 (TwoPageRight + R2L)\n在 Acrobat / SumatraPDF 等专业阅读器中默认以日漫双页右翻排版打开",
+                        );
 
-                let primary_btn = egui::Button::new(
-                    egui::RichText::new(btn_text)
-                        .font(FontId::proportional(15.0))
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(btn_fill);
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("分卷 / 输出文件名:").color(theme.text_muted),
+                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut active_seq.output_filename)
+                                    .desired_width(242.0),
+                            )
+                            .changed()
+                        {
+                            active_seq.name = active_seq.output_filename.clone();
+                        }
 
-                if ui.add_sized([242.0, 38.0], primary_btn).clicked() && !is_busy {
-                    self.trigger_generate_current();
-                }
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("输出保存目录:").color(theme.text_muted));
+                        ui.horizontal(|ui| {
+                            let mut dir_str = active_seq
+                                .output_dir
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut dir_str).desired_width(185.0),
+                                )
+                                .changed()
+                            {
+                                active_seq.output_dir = Some(PathBuf::from(dir_str));
+                            }
+                            if ui.add_sized([45.0, 22.0], egui::Button::new("浏览")).clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    active_seq.output_dir = Some(folder);
+                                }
+                            }
+                        });
 
-                ui.add_space(4.0);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(8.0);
 
-                if self.sequences.len() > 1 {
-                    let batch_btn = egui::Button::new(
-                        egui::RichText::new(format!(
-                            "批量生成全部分卷 ({} 个)",
-                            self.sequences.len()
-                        ))
-                        .font(FontId::proportional(12.0)),
-                    );
+                        // 主打包按钮
+                        let (btn_text, btn_fill) = if self.is_generating {
+                            ("⏳ 正在打包中...", Color32::from_rgb(156, 163, 175))
+                        } else if self.is_importing {
+                            ("⏳ 正在导入中...", Color32::from_rgb(156, 163, 175))
+                        } else {
+                            ("开始打包为 PDF", theme.primary_color)
+                        };
 
-                    if ui.add_sized([242.0, 30.0], batch_btn).clicked() && !is_busy {
-                        self.trigger_generate_all();
-                    }
-                }
+                        let primary_btn = egui::Button::new(
+                            egui::RichText::new(btn_text)
+                                .font(FontId::proportional(15.0))
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(btn_fill);
+
+                        if ui.add_sized([242.0, 38.0], primary_btn).clicked() && !is_busy {
+                            self.trigger_generate_current();
+                        }
+
+                        ui.add_space(4.0);
+
+                        if self.sequences.len() > 1 {
+                            let batch_btn = egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "批量生成全部分卷 ({} 个)",
+                                    self.sequences.len()
+                                ))
+                                .font(FontId::proportional(12.0)),
+                            );
+
+                            if ui.add_sized([242.0, 30.0], batch_btn).clicked() && !is_busy {
+                                self.trigger_generate_all();
+                            }
+                        }
+                    });
             });
     }
 
@@ -1095,8 +1154,11 @@ impl MangaPdfApp {
         is_hovering_files: bool,
     ) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 分卷标签栏 (顶部横向排列)
-            ui.horizontal_wrapped(|ui| {
+            if is_busy {
+                ui.disable();
+            }
+            // 分卷标签栏
+            ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("分卷管理:").strong());
 
                 let mut to_delete = None;
@@ -1886,10 +1948,7 @@ impl eframe::App for MangaPdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_async_messages(ctx);
 
-        // 前 5 帧连续应用样式以抵消 eframe 首帧的系统主题覆盖，之后仅在切换主题时更新，避免每帧重复分配 Style
-        if self.frame_count <= 5 {
-            self.apply_modern_styling(ctx);
-        }
+        self.apply_modern_styling(ctx);
 
         let is_busy = self.is_generating || self.is_importing;
         self.frame_count += 1;
