@@ -1237,18 +1237,23 @@ impl MangaPdfApp {
                     .fill(pill_bg)
                     .rounding(Rounding::same(14.0));
 
-                    let resp = ui
-                        .add(btn)
-                        .on_hover_text(format!("{} (点击切换，右键可删除)", seq.name));
+                    let hover_tip = if self.sequences.len() > 1 {
+                        format!("{} (点击切换，右键可删除)", seq.name)
+                    } else {
+                        format!("{} (点击切换)", seq.name)
+                    };
+                    let resp = ui.add(btn).on_hover_text(hover_tip);
                     if resp.clicked() {
                         self.active_sequence_idx = idx;
                     }
-                    resp.context_menu(|ui| {
-                        if self.sequences.len() > 1 && ui.button("删除分卷").clicked() {
-                            to_delete = Some(idx);
-                            ui.close_menu();
-                        }
-                    });
+                    if self.sequences.len() > 1 {
+                        resp.context_menu(|ui| {
+                            if ui.button("🗑️ 删除此分卷").clicked() {
+                                to_delete = Some(idx);
+                                ui.close_menu();
+                            }
+                        });
+                    }
                 }
 
                 if ui.button("+ 新建分卷").clicked() {
@@ -1752,19 +1757,23 @@ impl MangaPdfApp {
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(6.0);
+                ui.add_space(8.0);
 
-                // 靠左整齐排列特性要点
-                ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    ui.label("• 高清画廊大图预览 (支持 8K 条漫、自适应窗口与键盘翻页)");
-                    ui.label("• 原画无损直存 (JPEG 零拷贝直通 + PNG 原生无损保留)");
-                    ui.label("• 全链路异步多核加速 (后台丝滑导入与分批并发打包)");
-                    ui.label("• 智能自然语义排序与右键快捷置顶/置底调序");
-                    ui.label("• 支持子文件夹递归扫描、多卷自动拆分与日漫右翻跨页");
-                    ui.label("• 压缩画质动态重编 (10%~100% 自由可调)");
-                    ui.label("• 页面尺寸无缝自适应 (消除黑边与留白)");
-                    ui.label("• 纯本地静默生成 · 零依赖绿色运行");
-                });
+                // 精炼特性亮点
+                let features = [
+                    ("⚡ 原画无损直存", "JPEG 零拷贝与 PNG Flate 无损"),
+                    ("🚀 异步流畅体验", "后台多核并发，大图切页丝滑"),
+                    ("📖 专为漫画优化", "智能自然排序与日漫右翻跨页"),
+                ];
+
+                for (title, desc) in features {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(title).strong());
+                        ui.label(egui::RichText::new(desc).color(theme.text_muted));
+                    });
+                    ui.add_space(2.0);
+                }
 
                 ui.add_space(14.0);
                 ui.vertical_centered(|ui| {
