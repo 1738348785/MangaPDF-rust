@@ -14,7 +14,7 @@ impl PageSizeMode {
         match self {
             Self::Original => "保持原图尺寸 (推荐)",
             Self::FitA4 => "适应 A4 页面",
-            Self::FixedRatio => "统一宽度 (1200px)",
+            Self::FixedRatio => "统一宽度 (1200pt, 与首页等宽)",
         }
     }
 

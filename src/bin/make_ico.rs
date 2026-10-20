@@ -49,7 +49,7 @@ fn create_dib_frame(img: &DynamicImage, size: u32) -> IconFrame {
     }
 
     // 3. 1-bit AND mask (all 0s since alpha is in 32-bit channel)
-    let mask_row_bytes = ((width + 31) / 32) * 4;
+    let mask_row_bytes = width.div_ceil(32) * 4;
     let and_mask = vec![0u8; (mask_row_bytes * height) as usize];
     dib.extend_from_slice(&and_mask);
 

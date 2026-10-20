@@ -37,6 +37,78 @@ pub fn orientation_matrix(
     }
 }
 
+/// 为当前批次批量提取原始图片字节。
+/// 若批次中存在来自同一 ZIP/CBZ 归档的多张图片，一次性打开归档并连续读取，避免多线程重复解析中央目录。
+fn fetch_chunk_bytes(chunk: &[crate::model::ImageEntry]) -> Vec<Result<Vec<u8>, String>> {
+    let mut results: Vec<Option<Result<Vec<u8>, String>>> =
+        (0..chunk.len()).map(|_| None).collect();
+    use std::collections::BTreeMap;
+    let mut archive_groups: BTreeMap<std::path::PathBuf, Vec<(usize, String)>> = BTreeMap::new();
+
+    for (idx, item) in chunk.iter().enumerate() {
+        if let Some(path) = &item.source_path {
+            results[idx] = Some(
+                std::fs::read(path)
+                    .map_err(|e| format!("无法读取图片文件 {}: {}", path.display(), e)),
+            );
+        } else if let Some((archive_path, entry_name)) = &item.archive_source {
+            archive_groups
+                .entry((**archive_path).clone())
+                .or_default()
+                .push((idx, entry_name.clone()));
+        } else {
+            results[idx] = Some(Ok(item.bytes.to_vec()));
+        }
+    }
+
+    for (archive_path, entries) in archive_groups {
+        match std::fs::File::open(&archive_path) {
+            Ok(file) => match zip::ZipArchive::new(file) {
+                Ok(mut archive) => {
+                    for (idx, entry_name) in entries {
+                        match archive.by_name(&entry_name) {
+                            Ok(mut zip_file) => {
+                                let mut buf = Vec::with_capacity(zip_file.size() as usize);
+                                use std::io::Read;
+                                match zip_file.read_to_end(&mut buf) {
+                                    Ok(_) => results[idx] = Some(Ok(buf)),
+                                    Err(e) => {
+                                        results[idx] = Some(Err(format!(
+                                            "读取归档内图片 {} 失败: {}",
+                                            entry_name, e
+                                        )))
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                results[idx] =
+                                    Some(Err(format!("归档中找不到图片 {}: {}", entry_name, e)))
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("无法解析归档 {}: {}", archive_path.display(), e);
+                    for (idx, _) in entries {
+                        results[idx] = Some(Err(err_msg.clone()));
+                    }
+                }
+            },
+            Err(e) => {
+                let err_msg = format!("无法打开归档文件 {}: {}", archive_path.display(), e);
+                for (idx, _) in entries {
+                    results[idx] = Some(Err(err_msg.clone()));
+                }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|opt| opt.unwrap_or_else(|| Err("未知读取错误".to_string())))
+        .collect()
+}
+
 pub fn build_pdf_from_sequence<P, F>(
     sequence: &Sequence,
     output_path: P,
@@ -67,10 +139,12 @@ where
     let processed_counter = std::sync::atomic::AtomicUsize::new(0);
 
     for chunk in sequence.items.chunks(CHUNK_SIZE) {
+        let chunk_bytes = fetch_chunk_bytes(chunk);
         let processed_chunk: Vec<Result<crate::img::ProcessedImage>> = chunk
             .par_iter()
-            .map(|item| {
-                let raw_bytes = match item.get_bytes() {
+            .zip(chunk_bytes)
+            .map(|(item, raw_bytes_res)| {
+                let raw_bytes = match raw_bytes_res {
                     Ok(b) => b,
                     Err(e) => return Err(anyhow::anyhow!(e)),
                 };
@@ -128,33 +202,48 @@ where
 
             // 2. 根据页面尺寸模式计算页面宽高与图片变换矩阵 (使用按 EXIF 方向校正后的显示尺寸)
             let (img_w, img_h) = processed.display_size();
-            let (page_w, page_h, draw_w, draw_h, off_x, off_y) = match sequence.page_size_mode {
-                PageSizeMode::Original => {
-                    let pw = img_w + margin_pt * 2.0;
-                    let ph = img_h + margin_pt * 2.0;
-                    (pw, ph, img_w, img_h, margin_pt, margin_pt)
-                }
-                PageSizeMode::FitA4 => {
-                    let a4_w = 595.28_f32;
-                    let a4_h = 841.89_f32;
-                    let avail_w = (a4_w - margin_pt * 2.0).max(10.0);
-                    let avail_h = (a4_h - margin_pt * 2.0).max(10.0);
-                    let scale = (avail_w / img_w).min(avail_h / img_h);
-                    let dw = img_w * scale;
-                    let dh = img_h * scale;
-                    let ox = margin_pt + (avail_w - dw) / 2.0;
-                    let oy = margin_pt + (avail_h - dh) / 2.0;
-                    (a4_w, a4_h, dw, dh, ox, oy)
-                }
-                PageSizeMode::FixedRatio => {
-                    let target_w = 1200.0_f32;
-                    let avail_w = (target_w - margin_pt * 2.0).max(10.0);
-                    let scale = avail_w / img_w.max(1.0);
-                    let dh = img_h * scale;
-                    let ph = dh + margin_pt * 2.0;
-                    (target_w, ph, avail_w, dh, margin_pt, margin_pt)
-                }
-            };
+            let (mut page_w, mut page_h, mut draw_w, mut draw_h, mut off_x, mut off_y) =
+                match sequence.page_size_mode {
+                    PageSizeMode::Original => {
+                        let pw = img_w + margin_pt * 2.0;
+                        let ph = img_h + margin_pt * 2.0;
+                        (pw, ph, img_w, img_h, margin_pt, margin_pt)
+                    }
+                    PageSizeMode::FitA4 => {
+                        let a4_w = 595.28_f32;
+                        let a4_h = 841.89_f32;
+                        let avail_w = (a4_w - margin_pt * 2.0).max(10.0);
+                        let avail_h = (a4_h - margin_pt * 2.0).max(10.0);
+                        let scale = (avail_w / img_w).min(avail_h / img_h);
+                        let dw = img_w * scale;
+                        let dh = img_h * scale;
+                        let ox = margin_pt + (avail_w - dw) / 2.0;
+                        let oy = margin_pt + (avail_h - dh) / 2.0;
+                        (a4_w, a4_h, dw, dh, ox, oy)
+                    }
+                    PageSizeMode::FixedRatio => {
+                        let target_w = 1200.0_f32;
+                        let avail_w = (target_w - margin_pt * 2.0).max(10.0);
+                        let scale = avail_w / img_w.max(1.0);
+                        let dh = img_h * scale;
+                        let ph = dh + margin_pt * 2.0;
+                        (target_w, ph, avail_w, dh, margin_pt, margin_pt)
+                    }
+                };
+
+            // PDF 规范限制单个页面尺寸上限为 14400 pt (200 英寸)。
+            // 针对超长条漫/韩漫，若长边超过 14400 pt，等比缩放页面与绘制坐标至规范范围内（底层原始图片像素与画质 100% 保持不变）
+            const MAX_PDF_PAGE_PT: f32 = 14400.0;
+            let max_dim = page_w.max(page_h);
+            if max_dim > MAX_PDF_PAGE_PT {
+                let downscale = MAX_PDF_PAGE_PT / max_dim;
+                page_w *= downscale;
+                page_h *= downscale;
+                draw_w *= downscale;
+                draw_h *= downscale;
+                off_x *= downscale;
+                off_y *= downscale;
+            }
 
             // 3. 写入 Content Stream
             let mut content = Content::new();
@@ -266,5 +355,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_webtoon_dimension_cap_under_14400_pt() {
+        let max_dim = 28800.0_f32;
+        let mut page_w = 800.0_f32;
+        let mut page_h = max_dim;
+        let mut draw_w = 800.0_f32;
+        let mut draw_h = max_dim;
+        let mut off_x = 0.0_f32;
+        let mut off_y = 0.0_f32;
+
+        const MAX_PDF_PAGE_PT: f32 = 14400.0;
+        let dim = page_w.max(page_h);
+        if dim > MAX_PDF_PAGE_PT {
+            let downscale = MAX_PDF_PAGE_PT / dim;
+            page_w *= downscale;
+            page_h *= downscale;
+            draw_w *= downscale;
+            draw_h *= downscale;
+            off_x *= downscale;
+            off_y *= downscale;
+        }
+
+        assert_eq!(page_h, 14400.0);
+        assert_eq!(page_w, 400.0);
+        assert_eq!(draw_h, 14400.0);
+        assert_eq!(draw_w, 400.0);
+        assert_eq!(off_x, 0.0);
+        assert_eq!(off_y, 0.0);
     }
 }

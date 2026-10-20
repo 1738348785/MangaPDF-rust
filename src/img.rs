@@ -4,6 +4,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorSpace {
     DeviceGray,
@@ -75,16 +76,14 @@ pub fn create_image_entry(
     source_path: Option<PathBuf>,
     archive_source: Option<(Arc<PathBuf>, String)>,
 ) -> ImageEntry {
-    let (mut width, mut height) = match imagesize::blob_size(&bytes) {
-        Ok(size) => (size.width as u32, size.height as u32),
-        Err(_) => (800, 1200),
-    };
-
+    let mut width = 800;
+    let mut height = 1200;
     let mut thumb_rgb = None;
     let mut thumb_w = 0;
     let mut thumb_h = 0;
 
     // 生成轻量 UI 缩略图 (最大 100x140 像素以维持极低内存占用；按 EXIF 方向校正)
+    // 优先完整解码以直接提取真实方向与尺寸；仅在解码失败时才回退至快速头解析 blob_size
     if let Ok(dyn_img) = decode_oriented(&bytes) {
         width = dyn_img.width();
         height = dyn_img.height();
@@ -92,6 +91,9 @@ pub fn create_image_entry(
         thumb_w = thumb.width() as usize;
         thumb_h = thumb.height() as usize;
         thumb_rgb = Some(Arc::from(thumb.into_rgb8().into_raw()));
+    } else if let Ok(size) = imagesize::blob_size(&bytes) {
+        width = size.width as u32;
+        height = size.height as u32;
     }
 
     // 若图片来自本地磁盘文件或 ZIP/CBZ 归档，生成缩略图后立即释放原始大图字节，杜绝内存堆积

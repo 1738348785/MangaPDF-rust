@@ -7,7 +7,9 @@ fn main() {
         res.set_icon("assets/app_icon.ico");
 
         // 若使用 GNU 工具链且 PATH 中未直接找到 windres，智能探测常见安装路径作为后备
-        if std::env::var("TARGET").is_ok_and(|t| t.contains("gnu")) && which_tool("windres").is_none() {
+        if std::env::var("TARGET").is_ok_and(|t| t.contains("gnu"))
+            && which_tool("windres").is_none()
+        {
             let candidates = [
                 r"C:\msys64\ucrt64\bin\windres.exe",
                 r"C:\msys64\mingw64\bin\windres.exe",
