@@ -891,6 +891,7 @@ impl MangaPdfApp {
         egui::SidePanel::left("left_control_panel")
             .exact_width(270.0)
             .resizable(false)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::none()
                     .fill(theme.card_bg)
@@ -1020,6 +1021,7 @@ impl MangaPdfApp {
 
                         ui.add_space(3.0);
                         ui.add_enabled_ui(!active_seq.lossless_direct, |ui| {
+                            ui.spacing_mut().slider_width = 112.0;
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("压缩画质:").color(theme.text_muted));
                                 ui.add(
@@ -1070,9 +1072,9 @@ impl MangaPdfApp {
                             egui::RichText::new("分卷 / 输出文件名:").color(theme.text_muted),
                         );
                         if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut active_seq.output_filename)
-                                    .desired_width(242.0),
+                            .add_sized(
+                                [242.0, 22.0],
+                                egui::TextEdit::singleline(&mut active_seq.output_filename),
                             )
                             .changed()
                         {
@@ -1088,8 +1090,9 @@ impl MangaPdfApp {
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut dir_str).desired_width(185.0),
+                                .add_sized(
+                                    [189.0, 22.0],
+                                    egui::TextEdit::singleline(&mut dir_str),
                                 )
                                 .changed()
                             {
@@ -1945,6 +1948,15 @@ impl MangaPdfApp {
 }
 
 impl eframe::App for MangaPdfApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let bg = if self.is_dark_theme {
+            Color32::from_rgb(17, 24, 39)
+        } else {
+            Color32::from_rgb(249, 250, 251)
+        };
+        bg.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_async_messages(ctx);
 
