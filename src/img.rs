@@ -26,6 +26,45 @@ pub struct ProcessedImage {
     pub filter: Filter,
     pub stream_data: Vec<u8>,
     pub invert_cmyk: bool,
+    /// EXIF 方向 (1~8)。仅 JPEG 无损直通时可能 != 1，由 PDF 变换矩阵完成旋转/翻转，
+    /// 解码重编路径已在像素层面校正，恒为 1
+    pub orientation: u8,
+}
+
+impl ProcessedImage {
+    /// 按 EXIF 方向校正后的显示尺寸 (方向 5~8 需交换宽高)
+    pub fn display_size(&self) -> (f32, f32) {
+        if (5..=8).contains(&self.orientation) {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+}
+
+/// JPEG 头部解析结果
+struct JpegInfo {
+    width: f32,
+    height: f32,
+    color_space: ColorSpace,
+    bits_per_component: u8,
+    invert_cmyk: bool,
+    orientation: u8,
+}
+
+/// 解码图片并按 EXIF 方向自动旋转/翻转 (image 0.25 的 `decode()` 不会自动应用方向信息)
+pub fn decode_oriented(bytes: &[u8]) -> Result<image::DynamicImage> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("无法识别图片格式")?;
+    let mut decoder = reader.into_decoder().context("图片解码失败")?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).context("图片解码失败")?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
 /// 创建带有缩略图的图片条目 (针对磁盘文件和归档条目不常驻原始字节，仅保留缩略图以保证极低内存)
@@ -45,8 +84,8 @@ pub fn create_image_entry(
     let mut thumb_w = 0;
     let mut thumb_h = 0;
 
-    // 生成轻量 UI 缩略图 (最大 100x140 像素以维持极低内存占用)
-    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+    // 生成轻量 UI 缩略图 (最大 100x140 像素以维持极低内存占用；按 EXIF 方向校正)
+    if let Ok(dyn_img) = decode_oriented(&bytes) {
         width = dyn_img.width();
         height = dyn_img.height();
         let thumb = dyn_img.thumbnail(100, 140);
@@ -84,17 +123,17 @@ pub fn process_image_bytes(
 ) -> Result<ProcessedImage> {
     if lossless_direct {
         if is_jpeg(&bytes) {
-            if let Ok((width, height, color_space, bits_per_component, invert_cmyk)) =
-                parse_jpeg_header(&bytes)
-            {
+            // EXIF 方向不再回退重编码：保持 DCT 数据原样直通，旋转/翻转交给 PDF 变换矩阵
+            if let Ok(info) = parse_jpeg_header(&bytes) {
                 return Ok(ProcessedImage {
-                    width,
-                    height,
-                    color_space,
-                    bits_per_component,
+                    width: info.width,
+                    height: info.height,
+                    color_space: info.color_space,
+                    bits_per_component: info.bits_per_component,
                     filter: Filter::DctDecode,
                     stream_data: bytes,
-                    invert_cmyk,
+                    invert_cmyk: info.invert_cmyk,
+                    orientation: info.orientation,
                 });
             }
         }
@@ -117,16 +156,16 @@ fn is_jpeg(data: &[u8]) -> bool {
     data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
 }
 
-/// 检查 JPEG EXIF APP1 段是否包含非默认旋转方向 (Orientation != 1)
-fn has_non_default_exif_orientation(exif_seg: &[u8]) -> bool {
+/// 读取 JPEG EXIF APP1 段中的方向值 (Orientation, 1~8)；无效或缺失时返回 None
+fn exif_orientation(exif_seg: &[u8]) -> Option<u8> {
     if exif_seg.len() < 14 || &exif_seg[0..6] != b"Exif\0\0" {
-        return false;
+        return None;
     }
     let tiff = &exif_seg[6..];
     let is_le = match &tiff[0..2] {
         b"II" => true,
         b"MM" => false,
-        _ => return false,
+        _ => return None,
     };
     let read_u16 = |offset: usize| -> Option<u16> {
         let b = tiff.get(offset..offset + 2)?;
@@ -146,34 +185,27 @@ fn has_non_default_exif_orientation(exif_seg: &[u8]) -> bool {
     };
 
     if read_u16(2) != Some(42) {
-        return false;
+        return None;
     }
-    let Some(ifd_offset) = read_u32(4).map(|v| v as usize) else {
-        return false;
-    };
-    let Some(num_entries) = read_u16(ifd_offset).map(|v| v as usize) else {
-        return false;
-    };
+    let ifd_offset = read_u32(4)? as usize;
+    let num_entries = read_u16(ifd_offset)? as usize;
 
     for i in 0..num_entries.min(64) {
         let entry_offset = ifd_offset + 2 + i * 12;
-        if let Some(tag) = read_u16(entry_offset) {
-            if tag == 0x0112 {
-                if let Some(orientation) = read_u16(entry_offset + 8) {
-                    return (2..=8).contains(&orientation);
-                }
-            }
-        } else {
-            break;
+        let tag = read_u16(entry_offset)?;
+        if tag == 0x0112 {
+            let orientation = read_u16(entry_offset + 8)?;
+            return (1..=8).contains(&orientation).then_some(orientation as u8);
         }
     }
-    false
+    None
 }
 
-/// 零拷贝解析 JPEG 头部信息：(width, height, color_space, bits_per_component, invert_cmyk)
-fn parse_jpeg_header(data: &[u8]) -> Result<(f32, f32, ColorSpace, u8, bool)> {
+/// 零拷贝解析 JPEG 头部信息 (尺寸、色彩空间、位深、CMYK 反相、EXIF 方向)
+fn parse_jpeg_header(data: &[u8]) -> Result<JpegInfo> {
     let mut cursor = 2;
     let mut has_adobe_app14 = false;
+    let mut orientation = 1u8;
 
     while cursor + 4 <= data.len() {
         if data[cursor] != 0xFF {
@@ -192,7 +224,12 @@ fn parse_jpeg_header(data: &[u8]) -> Result<(f32, f32, ColorSpace, u8, bool)> {
         let marker = data[cursor];
         cursor += 1;
 
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) || marker == 0x00 || marker == 0x01 {
+        if marker == 0xD8
+            || marker == 0xD9
+            || (0xD0..=0xD7).contains(&marker)
+            || marker == 0x00
+            || marker == 0x01
+        {
             continue;
         }
 
@@ -207,9 +244,11 @@ fn parse_jpeg_header(data: &[u8]) -> Result<(f32, f32, ColorSpace, u8, bool)> {
 
         let seg = &data[cursor + 2..cursor + length];
 
-        // 检查 EXIF Orientation：若带有旋转/翻转标记，则回退至标准解码流程处理
-        if marker == 0xE1 && has_non_default_exif_orientation(seg) {
-            anyhow::bail!("JPEG 包含非默认 EXIF 方向信息");
+        // 记录 EXIF Orientation，交由 PDF 变换矩阵完成旋转/翻转 (保持 DCT 数据无损直通)
+        if marker == 0xE1 {
+            if let Some(o) = exif_orientation(seg) {
+                orientation = o;
+            }
         }
 
         // 检查 Adobe APP14 标记 (用于判断 CMYK JPEG 是否需要反相 Decode)
@@ -217,10 +256,7 @@ fn parse_jpeg_header(data: &[u8]) -> Result<(f32, f32, ColorSpace, u8, bool)> {
             has_adobe_app14 = true;
         }
 
-        let is_sof = matches!(
-            marker,
-            0xC0..=0xC2
-        );
+        let is_sof = matches!(marker, 0xC0..=0xC2);
 
         if is_sof && seg.len() >= 6 {
             let precision = seg[0];
@@ -235,14 +271,23 @@ fn parse_jpeg_header(data: &[u8]) -> Result<(f32, f32, ColorSpace, u8, bool)> {
                 anyhow::bail!("无效的 JPEG 宽高尺寸");
             }
 
+            // 仅 Adobe (Photoshop) 写出的 CMYK JPEG 以反相形式存储，需要 Decode [1 0 ...] 还原；
+            // 不带 APP14 标记的 CMYK JPEG 按常规值存储，不能反相
             let (color_space, invert_cmyk) = match components {
                 1 => (ColorSpace::DeviceGray, false),
                 3 => (ColorSpace::DeviceRgb, false),
-                4 => (ColorSpace::DeviceCmyk, has_adobe_app14 || true),
+                4 => (ColorSpace::DeviceCmyk, has_adobe_app14),
                 _ => anyhow::bail!("不支持的 JPEG 通道数: {}", components),
             };
 
-            return Ok((width, height, color_space, precision, invert_cmyk));
+            return Ok(JpegInfo {
+                width,
+                height,
+                color_space,
+                bits_per_component: precision,
+                invert_cmyk,
+                orientation,
+            });
         }
 
         cursor += length;
@@ -252,10 +297,7 @@ fn parse_jpeg_header(data: &[u8]) -> Result<(f32, f32, ColorSpace, u8, bool)> {
 }
 
 fn decode_and_compress_with_quality(bytes: &[u8], quality: u8) -> Result<ProcessedImage> {
-    let reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("无法识别图片格式")?;
-    let dynamic_img = reader.decode().context("图片解码失败")?;
+    let dynamic_img = decode_oriented(bytes)?;
 
     let width = dynamic_img.width() as f32;
     let height = dynamic_img.height() as f32;
@@ -280,6 +322,7 @@ fn decode_and_compress_with_quality(bytes: &[u8], quality: u8) -> Result<Process
                 filter: Filter::DctDecode,
                 stream_data: jpeg_buf,
                 invert_cmyk: false,
+                orientation: 1,
             })
         }
         _ => {
@@ -299,24 +342,20 @@ fn decode_and_compress_with_quality(bytes: &[u8], quality: u8) -> Result<Process
                 filter: Filter::DctDecode,
                 stream_data: jpeg_buf,
                 invert_cmyk: false,
+                orientation: 1,
             })
         }
     }
 }
 
 pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
-    let reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("无法识别图片格式")?;
-    let dynamic_img = reader.decode().context("图片解码失败")?;
+    let dynamic_img = decode_oriented(bytes)?;
 
     let width = dynamic_img.width() as f32;
     let height = dynamic_img.height() as f32;
 
     let (color_space, raw_pixels) = match dynamic_img.color() {
-        image::ColorType::L8 => {
-            (ColorSpace::DeviceGray, dynamic_img.into_luma8().into_raw())
-        }
+        image::ColorType::L8 => (ColorSpace::DeviceGray, dynamic_img.into_luma8().into_raw()),
         image::ColorType::La8 => {
             let luma_a = dynamic_img.into_luma_alpha8();
             let mut luma = Vec::with_capacity((width * height) as usize);
@@ -352,9 +391,7 @@ pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
             }
             (ColorSpace::DeviceRgb, rgb)
         }
-        _ => {
-            (ColorSpace::DeviceRgb, dynamic_img.into_rgb8().into_raw())
-        }
+        _ => (ColorSpace::DeviceRgb, dynamic_img.into_rgb8().into_raw()),
     };
 
     let stream_data = miniz_oxide::deflate::compress_to_vec_zlib(&raw_pixels, 6);
@@ -367,6 +404,7 @@ pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
         filter: Filter::FlateDecode,
         stream_data,
         invert_cmyk: false,
+        orientation: 1,
     })
 }
 
@@ -391,5 +429,99 @@ mod tests {
         assert_eq!(processed.filter, Filter::FlateDecode);
         assert_eq!(processed.color_space, ColorSpace::DeviceRgb);
         assert!(!processed.stream_data.is_empty());
+    }
+
+    /// 生成 w×h 的 RGB JPEG，并可选在 SOI 之后插入带 Orientation 标签的 EXIF APP1 段
+    fn make_jpeg(w: u32, h: u32, orientation: Option<u16>) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        let img =
+            image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x * 5) as u8, (y * 5) as u8, 128]));
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)
+            .unwrap();
+
+        let Some(o) = orientation else { return jpeg };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(b"MM\0\x2a\0\0\0\x08"); // 大端 TIFF 头，IFD0 偏移 8
+        payload.extend_from_slice(&1u16.to_be_bytes()); // 1 个条目
+        payload.extend_from_slice(&0x0112u16.to_be_bytes()); // Orientation
+        payload.extend_from_slice(&3u16.to_be_bytes()); // SHORT
+        payload.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        payload.extend_from_slice(&o.to_be_bytes());
+        payload.extend_from_slice(&[0, 0]);
+        payload.extend_from_slice(&0u32.to_be_bytes()); // 无下一个 IFD
+
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn test_jpeg_passthrough_keeps_exif_orientation() {
+        let bytes = make_jpeg(40, 20, Some(6));
+        let processed = process_image_bytes(bytes.clone(), true, 100).unwrap();
+        assert_eq!(processed.filter, Filter::DctDecode);
+        assert_eq!(
+            processed.stream_data, bytes,
+            "无损模式必须原样直通 DCT 数据"
+        );
+        assert_eq!(processed.orientation, 6);
+        assert_eq!((processed.width, processed.height), (40.0, 20.0));
+        assert_eq!(processed.display_size(), (20.0, 40.0));
+    }
+
+    #[test]
+    fn test_decode_applies_exif_orientation() {
+        let bytes = make_jpeg(40, 20, Some(6));
+        let img = decode_oriented(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (20, 40));
+
+        // 有损重编路径：像素已旋转，PDF 中无需再变换
+        let processed = process_image_bytes(bytes, false, 80).unwrap();
+        assert_eq!(processed.orientation, 1);
+        assert_eq!((processed.width, processed.height), (20.0, 40.0));
+
+        // 缩略图与记录的尺寸同样按方向校正
+        let entry = create_image_entry(1, "a.jpg".into(), make_jpeg(40, 20, Some(8)), None, None);
+        assert_eq!((entry.width, entry.height), (20, 40));
+        assert!(entry.thumb_height > entry.thumb_width);
+    }
+
+    #[test]
+    fn test_jpeg_without_exif_is_upright() {
+        let processed = process_image_bytes(make_jpeg(40, 20, None), true, 100).unwrap();
+        assert_eq!(processed.orientation, 1);
+        assert_eq!(processed.display_size(), (40.0, 20.0));
+    }
+
+    /// 构造仅含 (可选 APP14) + 4 通道 SOF0 的最小 JPEG 头
+    fn cmyk_header(with_adobe: bool) -> Vec<u8> {
+        let mut d = vec![0xFF, 0xD8];
+        if with_adobe {
+            d.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+            d.extend_from_slice(b"Adobe");
+            d.extend_from_slice(&[0, 100, 0, 0, 0, 0, 2]);
+        }
+        d.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x14, 8, 0, 16, 0, 16, 4]);
+        for id in 1..=4u8 {
+            d.extend_from_slice(&[id, 0x11, 0]);
+        }
+        d.extend_from_slice(&[0xFF, 0xD9]);
+        d
+    }
+
+    #[test]
+    fn test_cmyk_invert_only_with_adobe_marker() {
+        let plain = parse_jpeg_header(&cmyk_header(false)).unwrap();
+        assert_eq!(plain.color_space, ColorSpace::DeviceCmyk);
+        assert!(!plain.invert_cmyk, "无 Adobe APP14 的 CMYK 不应反相");
+
+        let adobe = parse_jpeg_header(&cmyk_header(true)).unwrap();
+        assert_eq!(adobe.color_space, ColorSpace::DeviceCmyk);
+        assert!(adobe.invert_cmyk, "Adobe CMYK JPEG 需要反相 Decode");
     }
 }

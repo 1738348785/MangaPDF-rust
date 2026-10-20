@@ -101,7 +101,7 @@ impl Sequence {
             output_dir: default_desktop_dir(),
             output_filename,
             page_size_mode: PageSizeMode::Original,
-            quality: 100, // 默认 100% 满画质
+            quality: 100,          // 默认 100% 满画质
             lossless_direct: true, // 保持原画无损直存 (JPEG + PNG 全无损)
             margin_mm: 0,
             manga_rtl_spread: false, // 默认关闭日漫右翻跨页模式
@@ -109,7 +109,8 @@ impl Sequence {
     }
 
     pub fn natural_sort(&mut self) {
-        self.items.sort_by(|a, b| natord::compare_ignore_case(&a.name, &b.name));
+        self.items
+            .sort_by(|a, b| natord::compare_ignore_case(&a.name, &b.name));
     }
 
     pub fn remove_at(&mut self, idx: usize) {

@@ -6,9 +6,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const SUPPORTED_IMG_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "bmp", "jfif",
-];
+pub const SUPPORTED_IMG_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "jfif"];
 
 pub const SUPPORTED_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "cbz"];
 
@@ -31,7 +29,10 @@ pub fn is_archive(path: &Path) -> bool {
 /// 检查是否为应该忽略的系统隐藏目录
 pub fn is_system_hidden_dir(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == "__macosx" || lower.starts_with('.') || lower == "$recycle.bin" || lower == "system volume information"
+    lower == "__macosx"
+        || lower.starts_with('.')
+        || lower == "$recycle.bin"
+        || lower == "system volume information"
 }
 
 /// 收集目录下的图片文件 (支持递归开关与智能过滤)
@@ -86,11 +87,14 @@ pub fn collect_image_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
 }
 
 /// 从文件路径列表中加载图片 (按自然语言自然排序，支持分批并发与进度回调)
+///
+/// 返回 (成功导入的条目, 问题列表)。读取失败的文件会被跳过；无法解码预览的图片仍会保留，
+/// 但会记入问题列表提醒用户 (超大 JPEG 可能仍能直通写入 PDF)。
 pub fn load_entries_from_paths_with_progress<F>(
     paths: &[PathBuf],
     mut start_id: usize,
     progress_cb: Option<&F>,
-) -> Vec<ImageEntry>
+) -> (Vec<ImageEntry>, Vec<String>)
 where
     F: Fn(usize, usize, &str) + Send + Sync,
 {
@@ -106,7 +110,11 @@ where
         .filter_map(|p| {
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                 if is_image_extension(ext) {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     let id = start_id;
                     start_id += 1;
                     return Some((id, name, p));
@@ -119,13 +127,17 @@ where
     let total = raw_files.len();
     let counter = std::sync::atomic::AtomicUsize::new(0);
     let mut result = Vec::with_capacity(total);
+    let mut errors = Vec::new();
 
     for chunk in raw_files.chunks(32) {
-        let chunk_entries: Vec<ImageEntry> = chunk
+        let chunk_entries: Vec<Result<ImageEntry, String>> = chunk
             .into_par_iter()
             .map(|(id, name, path)| {
-                let bytes = fs::read(path).unwrap_or_default();
-                let entry = create_image_entry(*id, name.clone(), bytes, Some(path.clone()), None);
+                let entry = fs::read(path)
+                    .map(|bytes| {
+                        create_image_entry(*id, name.clone(), bytes, Some(path.clone()), None)
+                    })
+                    .map_err(|e| format!("{}: 读取失败 ({})", name, e));
                 let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if let Some(cb) = progress_cb {
                     cb(done, total, name);
@@ -133,10 +145,20 @@ where
                 entry
             })
             .collect();
-        result.extend(chunk_entries);
+        for res in chunk_entries {
+            match res {
+                Ok(entry) => {
+                    if entry.thumb_rgb.is_none() {
+                        errors.push(format!("{}: 无法解码预览，图片可能已损坏", entry.name));
+                    }
+                    result.push(entry);
+                }
+                Err(e) => errors.push(e),
+            }
+        }
     }
 
-    result
+    (result, errors)
 }
 
 /// 从文件夹中加载所有图片 (可指定是否递归扫描，支持进度回调)
@@ -145,12 +167,16 @@ pub fn load_entries_from_folder_with_progress<F>(
     start_id: usize,
     recursive: bool,
     progress_cb: Option<&F>,
-) -> Result<Vec<ImageEntry>>
+) -> Result<(Vec<ImageEntry>, Vec<String>)>
 where
     F: Fn(usize, usize, &str) + Send + Sync,
 {
     let file_paths = collect_image_files(dir, recursive);
-    Ok(load_entries_from_paths_with_progress(&file_paths, start_id, progress_cb))
+    Ok(load_entries_from_paths_with_progress(
+        &file_paths,
+        start_id,
+        progress_cb,
+    ))
 }
 
 /// 检查目录是否包含多个直接分卷子目录
@@ -180,11 +206,13 @@ pub fn get_direct_subfolders(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// 从 ZIP / CBZ 压缩包中分批读取图片生成缩略图（不常驻解压字节，严格控制峰值内存）
+///
+/// 归档本身无法打开/解析时返回 Err；单个条目读取失败则跳过并记入问题列表。
 pub fn load_entries_from_archive_with_progress<F>(
     archive_path: &Path,
     mut start_id: usize,
     progress_cb: Option<&F>,
-) -> Result<Vec<ImageEntry>>
+) -> Result<(Vec<ImageEntry>, Vec<String>)>
 where
     F: Fn(usize, usize, &str) + Send + Sync,
 {
@@ -200,7 +228,8 @@ where
         if !zip_file.is_dir() {
             if let Some(ext) = Path::new(&name).extension().and_then(|s| s.to_str()) {
                 if is_image_extension(ext) {
-                    let is_ignored = name.split('/').any(is_system_hidden_dir) || name.split('\\').any(is_system_hidden_dir);
+                    let is_ignored = name.split('/').any(is_system_hidden_dir)
+                        || name.split('\\').any(is_system_hidden_dir);
                     if !is_ignored {
                         valid_entries.push((i, name));
                     }
@@ -215,18 +244,29 @@ where
     let counter = std::sync::atomic::AtomicUsize::new(0);
     let archive_arc = std::sync::Arc::new(archive_path.to_path_buf());
     let mut entries = Vec::with_capacity(total);
+    let mut errors = Vec::new();
 
     for chunk in valid_entries.chunks(32) {
         let mut raw_chunk = Vec::with_capacity(chunk.len());
         for (index, entry_name) in chunk {
-            let mut zip_file = archive.by_index(*index)?;
-            let mut bytes = Vec::with_capacity(zip_file.size() as usize);
-            zip_file.read_to_end(&mut bytes)?;
             let display_name = Path::new(entry_name)
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let read_res = archive.by_index(*index).and_then(|mut zip_file| {
+                let mut bytes = Vec::with_capacity(zip_file.size() as usize);
+                zip_file.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            });
+            let bytes = match read_res {
+                Ok(b) => b,
+                Err(e) => {
+                    errors.push(format!("{}: 解压失败 ({})", entry_name, e));
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+            };
             let id = start_id;
             start_id += 1;
             raw_chunk.push((id, display_name, entry_name.clone(), bytes));
@@ -250,8 +290,13 @@ where
             })
             .collect();
 
+        for entry in &chunk_processed {
+            if entry.thumb_rgb.is_none() {
+                errors.push(format!("{}: 无法解码预览，图片可能已损坏", entry.name));
+            }
+        }
         entries.extend(chunk_processed);
     }
 
-    Ok(entries)
+    Ok((entries, errors))
 }

@@ -1,6 +1,6 @@
+use image::{imageops::FilterType, DynamicImage, Rgba, RgbaImage};
 use std::fs;
 use std::path::Path;
-use image::{imageops::FilterType, DynamicImage, Rgba, RgbaImage};
 
 struct IconFrame {
     width: u32,
@@ -9,7 +9,9 @@ struct IconFrame {
 }
 
 fn create_dib_frame(img: &DynamicImage, size: u32) -> IconFrame {
-    let resized = img.resize_exact(size, size, FilterType::Lanczos3).to_rgba8();
+    let resized = img
+        .resize_exact(size, size, FilterType::Lanczos3)
+        .to_rgba8();
     let width = size;
     let height = size;
 
@@ -62,7 +64,9 @@ fn create_png_frame(img: &DynamicImage, size: u32) -> IconFrame {
     let resized = img.resize_exact(size, size, FilterType::Lanczos3);
     let mut png_bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut png_bytes);
-    resized.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+    resized
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .unwrap();
 
     IconFrame {
         width: size,
@@ -85,7 +89,9 @@ fn sd_rounded_box(px: f32, py: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
 fn smooth_and_transparize(input_img: &DynamicImage) -> DynamicImage {
     // 1. Crop to the content bounds and upscale 4x to high-res canvas (1024x1024)
     let target_dim = 1024u32;
-    let high_res = input_img.resize_exact(target_dim, target_dim, FilterType::Lanczos3).to_rgba8();
+    let high_res = input_img
+        .resize_exact(target_dim, target_dim, FilterType::Lanczos3)
+        .to_rgba8();
 
     let mut output = RgbaImage::new(target_dim, target_dim);
 
@@ -125,7 +131,7 @@ fn smooth_and_transparize(input_img: &DynamicImage) -> DynamicImage {
                 let r = src_px[0];
                 let g = src_px[1];
                 let b = src_px[2];
-                
+
                 let final_alpha = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
                 output.put_pixel(x, y, Rgba([r, g, b, final_alpha]));
             } else {
@@ -186,8 +192,16 @@ fn main() -> anyhow::Result<()> {
 
     // 2. Directory Entries (16 bytes each)
     for frame in &frames {
-        let w_byte = if frame.width >= 256 { 0 } else { frame.width as u8 };
-        let h_byte = if frame.height >= 256 { 0 } else { frame.height as u8 };
+        let w_byte = if frame.width >= 256 {
+            0
+        } else {
+            frame.width as u8
+        };
+        let h_byte = if frame.height >= 256 {
+            0
+        } else {
+            frame.height as u8
+        };
         ico.push(w_byte);
         ico.push(h_byte);
         ico.push(0); // Palette

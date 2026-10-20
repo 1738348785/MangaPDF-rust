@@ -63,10 +63,9 @@ fn setup_custom_fonts(ctx: &egui::Context) {
         let path = Path::new(path_str);
         if path.exists() {
             if let Ok(font_data) = fs::read(path) {
-                fonts.font_data.insert(
-                    "chinese_font".to_owned(),
-                    FontData::from_owned(font_data),
-                );
+                fonts
+                    .font_data
+                    .insert("chinese_font".to_owned(), FontData::from_owned(font_data));
 
                 fonts
                     .families

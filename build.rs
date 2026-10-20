@@ -22,7 +22,7 @@ fn main() {
         .unwrap_or("windres");
 
         let status = Command::new(windres_cmd)
-            .args(&["-i", "app.rc", "-O", "coff", "-o"])
+            .args(["-i", "app.rc", "-O", "coff", "-o"])
             .arg(&res_path)
             .status()
             .expect("Failed to execute windres");
