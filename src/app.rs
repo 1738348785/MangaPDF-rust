@@ -1248,7 +1248,7 @@ impl MangaPdfApp {
                     }
                     if self.sequences.len() > 1 {
                         resp.context_menu(|ui| {
-                            if ui.button("🗑️ 删除此分卷").clicked() {
+                            if ui.button("🗑 删除此分卷").clicked() {
                                 to_delete = Some(idx);
                                 ui.close_menu();
                             }
