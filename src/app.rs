@@ -1204,82 +1204,87 @@ impl MangaPdfApp {
             if is_busy {
                 ui.disable();
             }
-            // 分卷标签栏
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("分卷管理:").strong());
+            // 分卷标签栏 (自适应自动折行，杜绝分卷过多超出边框被截断)
+            egui::ScrollArea::vertical()
+                .max_height(96.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("分卷管理:").strong());
 
-                let mut to_delete = None;
-                for (idx, seq) in self.sequences.iter().enumerate() {
-                    let is_active = idx == self.active_sequence_idx;
-                    let pill_bg = if is_active {
-                        theme.primary_color
-                    } else if theme.is_dark {
-                        Color32::from_rgb(31, 41, 55)
-                    } else {
-                        Color32::from_rgb(243, 244, 246)
-                    };
-                    let text_color = if is_active {
-                        Color32::WHITE
-                    } else {
-                        ui.visuals().text_color()
-                    };
+                        let mut to_delete = None;
+                        for (idx, seq) in self.sequences.iter().enumerate() {
+                            let is_active = idx == self.active_sequence_idx;
+                            let pill_bg = if is_active {
+                                theme.primary_color
+                            } else if theme.is_dark {
+                                Color32::from_rgb(31, 41, 55)
+                            } else {
+                                Color32::from_rgb(243, 244, 246)
+                            };
+                            let text_color = if is_active {
+                                Color32::WHITE
+                            } else {
+                                ui.visuals().text_color()
+                            };
 
-                    let short_name = if seq.name.chars().count() > 18 {
-                        format!("{}...", seq.name.chars().take(16).collect::<String>())
-                    } else {
-                        seq.name.clone()
-                    };
+                            let short_name = if seq.name.chars().count() > 18 {
+                                format!("{}...", seq.name.chars().take(16).collect::<String>())
+                            } else {
+                                seq.name.clone()
+                            };
 
-                    let label_text = format!("{} ({}页)", short_name, seq.items.len());
-                    let btn = egui::Button::new(
-                        egui::RichText::new(label_text).color(text_color).strong(),
-                    )
-                    .fill(pill_bg)
-                    .rounding(Rounding::same(14.0));
+                            let label_text = format!("{} ({}页)", short_name, seq.items.len());
+                            let btn = egui::Button::new(
+                                egui::RichText::new(label_text).color(text_color).strong(),
+                            )
+                            .fill(pill_bg)
+                            .rounding(Rounding::same(14.0));
 
-                    let hover_tip = if self.sequences.len() > 1 {
-                        format!("{} (点击切换，右键可删除)", seq.name)
-                    } else {
-                        format!("{} (点击切换)", seq.name)
-                    };
-                    let resp = ui.add(btn).on_hover_text(hover_tip);
-                    if resp.clicked() {
-                        self.active_sequence_idx = idx;
-                    }
-                    if self.sequences.len() > 1 {
-                        resp.context_menu(|ui| {
-                            if ui.button("🗑 删除此分卷").clicked() {
-                                to_delete = Some(idx);
-                                ui.close_menu();
+                            let hover_tip = if self.sequences.len() > 1 {
+                                format!("{} (点击切换，右键可删除)", seq.name)
+                            } else {
+                                format!("{} (点击切换)", seq.name)
+                            };
+                            let resp = ui.add(btn).on_hover_text(hover_tip);
+                            if resp.clicked() {
+                                self.active_sequence_idx = idx;
                             }
-                        });
-                    }
-                }
+                            if self.sequences.len() > 1 {
+                                resp.context_menu(|ui| {
+                                    if ui.button("🗑 删除此分卷").clicked() {
+                                        to_delete = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        }
 
-                if ui.button("+ 新建分卷").clicked() {
-                    let name = format!("第 {:02} 卷", self.next_sequence_id);
-                    let new_seq = Sequence::new(self.next_sequence_id, name);
-                    self.next_sequence_id += 1;
-                    self.sequences.push(new_seq);
-                    self.active_sequence_idx = self.sequences.len() - 1;
-                }
+                        if ui.button("+ 新建分卷").clicked() {
+                            let name = format!("第 {:02} 卷", self.next_sequence_id);
+                            let new_seq = Sequence::new(self.next_sequence_id, name);
+                            self.next_sequence_id += 1;
+                            self.sequences.push(new_seq);
+                            self.active_sequence_idx = self.sequences.len() - 1;
+                        }
 
-                if self.sequences.len() > 1 && ui.button("× 删除").clicked() {
-                    to_delete = Some(self.active_sequence_idx);
-                }
+                        if self.sequences.len() > 1 && ui.button("× 删除").clicked() {
+                            to_delete = Some(self.active_sequence_idx);
+                        }
 
-                if let Some(idx) = to_delete {
-                    self.sequences.remove(idx);
-                    // 删除位于当前分卷之前的分卷时，当前索引需前移一位，否则会悄悄切换到相邻分卷
-                    if idx < self.active_sequence_idx {
-                        self.active_sequence_idx -= 1;
-                    }
-                    if self.active_sequence_idx >= self.sequences.len() {
-                        self.active_sequence_idx = self.sequences.len() - 1;
-                    }
-                    self.cleanup_stale_textures();
-                }
-            });
+                        if let Some(idx) = to_delete {
+                            self.sequences.remove(idx);
+                            // 删除位于当前分卷之前的分卷时，当前索引需前移一位，否则会悄悄切换到相邻分卷
+                            if idx < self.active_sequence_idx {
+                                self.active_sequence_idx -= 1;
+                            }
+                            if self.active_sequence_idx >= self.sequences.len() {
+                                self.active_sequence_idx = self.sequences.len() - 1;
+                            }
+                            self.cleanup_stale_textures();
+                        }
+                    });
+                });
 
             ui.add_space(8.0);
 
