@@ -26,7 +26,7 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1080.0, 720.0])
         .with_min_inner_size([860.0, 580.0])
-        .with_title("MangaPDF - 漫画与图片打包工具")
+        .with_title("MangaPDF")
         .with_drag_and_drop(true);
 
     if let Some(icon) = load_app_icon() {
@@ -39,7 +39,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "MangaPDF - 漫画与图片打包工具",
+        "MangaPDF",
         options,
         Box::new(|cc| {
             setup_custom_fonts(&cc.egui_ctx);

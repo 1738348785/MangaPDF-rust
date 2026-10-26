@@ -117,7 +117,7 @@ pub fn create_image_entry(
     }
 }
 
-/// 解析并处理图片数据以供 PDF 组装 (支持原画无损直存：JPEG 零解码零拷贝直通 + PNG Flate 无损；或按指定画质 10%~100% 压缩重编)
+/// 解析并处理图片数据以供 PDF 组装 (支持原画无损直存：JPEG 零解码零拷贝直通 + 其余格式 Flate 像素无损；或按指定画质 10%~100% 压缩重编)
 pub fn process_image_bytes(
     bytes: Vec<u8>,
     lossless_direct: bool,
@@ -140,16 +140,13 @@ pub fn process_image_bytes(
             }
         }
 
-        if is_png(&bytes) {
-            if let Ok(processed) = decode_and_compress_flate(&bytes) {
-                return Ok(processed);
-            }
-        }
+        return decode_and_compress_flate(&bytes);
     }
 
     decode_and_compress_with_quality(&bytes, quality)
 }
 
+#[allow(dead_code)]
 pub fn is_png(data: &[u8]) -> bool {
     data.len() >= 8 && data.starts_with(b"\x89PNG\r\n\x1a\n")
 }

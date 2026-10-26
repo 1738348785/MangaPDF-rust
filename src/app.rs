@@ -609,7 +609,7 @@ impl MangaPdfApp {
                                 current.output_dir = group.out_dir;
                             }
                             current.items.extend(group.entries);
-                            current.natural_sort();
+                            // 保留用户已手动调好的顺序，新散图已在导入阶段完成自然排序
                         }
                     }
 
@@ -822,7 +822,7 @@ impl MangaPdfApp {
 
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("漫画与图包转 PDF 工具")
+                        egui::RichText::new("漫画与图片转 PDF 工具")
                             .font(FontId::proportional(14.0))
                             .strong(),
                     );
