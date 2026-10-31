@@ -9,7 +9,7 @@ mod source;
 use app::MangaPdfApp;
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 fn load_app_icon() -> Option<egui::IconData> {
     let icon_bytes = include_bytes!("../assets/icon.png");
@@ -52,15 +52,16 @@ fn main() -> eframe::Result<()> {
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
-    let font_candidates = [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\msyh.ttf",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-    ];
+    let windows_dir = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+    let fonts_dir = windows_dir.join("Fonts");
 
-    for path_str in font_candidates {
-        let path = Path::new(path_str);
+    let font_candidates = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"];
+
+    for file_name in font_candidates {
+        let path = fonts_dir.join(file_name);
         if path.exists() {
             if let Ok(font_data) = fs::read(path) {
                 fonts

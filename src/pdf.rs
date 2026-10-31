@@ -13,6 +13,82 @@ pub struct BuildReport {
     pub skipped: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageLayoutBox {
+    pub page_w: f32,
+    pub page_h: f32,
+    pub draw_w: f32,
+    pub draw_h: f32,
+    pub off_x: f32,
+    pub off_y: f32,
+}
+
+/// 根据页面尺寸模式、方向校正后的图片尺寸与边距 (pt) 计算 PDF 页面尺寸与绘制区域。
+/// 自动钳制极端边距防止坐标越出页面，并按 PDF 规范上限 (14400 pt) 等比缩放超长条漫。
+pub fn compute_page_layout(
+    mode: PageSizeMode,
+    img_w: f32,
+    img_h: f32,
+    margin_pt: f32,
+) -> PageLayoutBox {
+    let img_w = img_w.max(1.0);
+    let img_h = img_h.max(1.0);
+    let margin_pt = margin_pt.max(0.0);
+
+    let (mut page_w, mut page_h, mut draw_w, mut draw_h, mut off_x, mut off_y) = match mode {
+        PageSizeMode::Original => {
+            let pw = img_w + margin_pt * 2.0;
+            let ph = img_h + margin_pt * 2.0;
+            (pw, ph, img_w, img_h, margin_pt, margin_pt)
+        }
+        PageSizeMode::FitA4 => {
+            let a4_w = 595.28_f32;
+            let a4_h = 841.89_f32;
+            let eff_margin = margin_pt.min((a4_w - 10.0) / 2.0).min((a4_h - 10.0) / 2.0);
+            let avail_w = (a4_w - eff_margin * 2.0).max(10.0);
+            let avail_h = (a4_h - eff_margin * 2.0).max(10.0);
+            let scale = (avail_w / img_w).min(avail_h / img_h);
+            let dw = img_w * scale;
+            let dh = img_h * scale;
+            let ox = eff_margin + (avail_w - dw) / 2.0;
+            let oy = eff_margin + (avail_h - dh) / 2.0;
+            (a4_w, a4_h, dw, dh, ox, oy)
+        }
+        PageSizeMode::FixedRatio => {
+            let target_w = 1200.0_f32;
+            let eff_margin = margin_pt.min((target_w - 10.0) / 2.0);
+            let avail_w = (target_w - eff_margin * 2.0).max(10.0);
+            let scale = avail_w / img_w;
+            let dh = img_h * scale;
+            let ph = dh + eff_margin * 2.0;
+            (target_w, ph, avail_w, dh, eff_margin, eff_margin)
+        }
+    };
+
+    // PDF 规范限制单个页面尺寸上限为 14400 pt (200 英寸)。
+    // 针对超长条漫/韩漫，若长边超过 14400 pt，等比缩放页面与绘制坐标至规范范围内（底层原始图片像素与画质 100% 保持不变）
+    const MAX_PDF_PAGE_PT: f32 = 14400.0;
+    let max_dim = page_w.max(page_h);
+    if max_dim > MAX_PDF_PAGE_PT {
+        let downscale = MAX_PDF_PAGE_PT / max_dim;
+        page_w *= downscale;
+        page_h *= downscale;
+        draw_w *= downscale;
+        draw_h *= downscale;
+        off_x *= downscale;
+        off_y *= downscale;
+    }
+
+    PageLayoutBox {
+        page_w,
+        page_h,
+        draw_w,
+        draw_h,
+        off_x,
+        off_y,
+    }
+}
+
 /// 计算将图片单位方块映射到页面显示区域 (off_x, off_y, draw_w, draw_h) 的变换矩阵，
 /// 同时按 EXIF 方向 (1~8) 完成旋转/翻转。draw_w / draw_h 为校正方向后的显示尺寸。
 ///
@@ -68,7 +144,9 @@ fn fetch_chunk_bytes(chunk: &[crate::model::ImageEntry]) -> Vec<Result<Vec<u8>, 
                     for (idx, entry_name) in entries {
                         match archive.by_name(&entry_name) {
                             Ok(mut zip_file) => {
-                                let mut buf = Vec::with_capacity(zip_file.size() as usize);
+                                let cap = zip_file.size().min(crate::model::MAX_ZIP_PREALLOC_BYTES)
+                                    as usize;
+                                let mut buf = Vec::with_capacity(cap);
                                 use std::io::Read;
                                 match zip_file.read_to_end(&mut buf) {
                                     Ok(_) => results[idx] = Some(Ok(buf)),
@@ -202,58 +280,17 @@ where
 
             // 2. 根据页面尺寸模式计算页面宽高与图片变换矩阵 (使用按 EXIF 方向校正后的显示尺寸)
             let (img_w, img_h) = processed.display_size();
-            let (mut page_w, mut page_h, mut draw_w, mut draw_h, mut off_x, mut off_y) =
-                match sequence.page_size_mode {
-                    PageSizeMode::Original => {
-                        let pw = img_w + margin_pt * 2.0;
-                        let ph = img_h + margin_pt * 2.0;
-                        (pw, ph, img_w, img_h, margin_pt, margin_pt)
-                    }
-                    PageSizeMode::FitA4 => {
-                        let a4_w = 595.28_f32;
-                        let a4_h = 841.89_f32;
-                        let avail_w = (a4_w - margin_pt * 2.0).max(10.0);
-                        let avail_h = (a4_h - margin_pt * 2.0).max(10.0);
-                        let scale = (avail_w / img_w).min(avail_h / img_h);
-                        let dw = img_w * scale;
-                        let dh = img_h * scale;
-                        let ox = margin_pt + (avail_w - dw) / 2.0;
-                        let oy = margin_pt + (avail_h - dh) / 2.0;
-                        (a4_w, a4_h, dw, dh, ox, oy)
-                    }
-                    PageSizeMode::FixedRatio => {
-                        let target_w = 1200.0_f32;
-                        let avail_w = (target_w - margin_pt * 2.0).max(10.0);
-                        let scale = avail_w / img_w.max(1.0);
-                        let dh = img_h * scale;
-                        let ph = dh + margin_pt * 2.0;
-                        (target_w, ph, avail_w, dh, margin_pt, margin_pt)
-                    }
-                };
-
-            // PDF 规范限制单个页面尺寸上限为 14400 pt (200 英寸)。
-            // 针对超长条漫/韩漫，若长边超过 14400 pt，等比缩放页面与绘制坐标至规范范围内（底层原始图片像素与画质 100% 保持不变）
-            const MAX_PDF_PAGE_PT: f32 = 14400.0;
-            let max_dim = page_w.max(page_h);
-            if max_dim > MAX_PDF_PAGE_PT {
-                let downscale = MAX_PDF_PAGE_PT / max_dim;
-                page_w *= downscale;
-                page_h *= downscale;
-                draw_w *= downscale;
-                draw_h *= downscale;
-                off_x *= downscale;
-                off_y *= downscale;
-            }
+            let layout = compute_page_layout(sequence.page_size_mode, img_w, img_h, margin_pt);
 
             // 3. 写入 Content Stream
             let mut content = Content::new();
             content.save_state();
             content.transform(orientation_matrix(
                 processed.orientation,
-                draw_w,
-                draw_h,
-                off_x,
-                off_y,
+                layout.draw_w,
+                layout.draw_h,
+                layout.off_x,
+                layout.off_y,
             ));
             content.x_object(Name(b"Im0"));
             content.restore_state();
@@ -263,7 +300,7 @@ where
             // 4. 写入 Page 对象
             let mut page = pdf.page(page_id);
             page.parent(page_tree_id);
-            page.media_box(Rect::new(0.0, 0.0, page_w, page_h));
+            page.media_box(Rect::new(0.0, 0.0, layout.page_w, layout.page_h));
             let mut resources = page.resources();
             resources.x_objects().pair(Name(b"Im0"), image_id);
             resources.finish();
@@ -302,32 +339,61 @@ where
     catalog.finish();
 
     let pdf_data = pdf.finish();
-    let out_path = output_path.as_ref();
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("无法创建输出目录 \"{}\"：{}", parent.display(), e)
-            })?;
-        }
-    }
-
-    let mut file = File::create(out_path).map_err(|e| {
-        let hint = if out_path.is_dir() {
-            "（目标路径是一个已存在的文件夹）"
-        } else if matches!(e.raw_os_error(), Some(5) | Some(32)) {
-            "（请检查同名 PDF 是否正被阅读器打开占用，或输出目录是否有写入权限）"
-        } else {
-            ""
-        };
-        anyhow::anyhow!("无法写入 \"{}\"：{}{}", out_path.display(), e, hint)
-    })?;
-    file.write_all(&pdf_data)
-        .map_err(|e| anyhow::anyhow!("写入 PDF 数据失败 \"{}\"：{}", out_path.display(), e))?;
+    write_pdf_atomically(output_path.as_ref(), &pdf_data)?;
 
     Ok(BuildReport {
         pages: success_count,
         skipped,
     })
+}
+
+/// 原子化写入 PDF 文件：先写入同目录下的临时文件，成功刷盘并关闭句柄后再原子替换目标文件，
+/// 防止覆盖已有 PDF 时因中途磁盘空间不足或写入异常将原文件截断损坏。
+fn write_pdf_atomically(out_path: &Path, pdf_data: &[u8]) -> Result<()> {
+    if out_path.is_dir() {
+        anyhow::bail!(
+            "无法写入 \"{}\"：（目标路径是一个已存在的文件夹）",
+            out_path.display()
+        );
+    }
+
+    let parent = out_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("无法创建输出目录 \"{}\"：{}", parent.display(), e))?;
+    }
+
+    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = out_path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp_path = parent.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), seq));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut tmp_file = File::create(&tmp_path)?;
+        tmp_file.write_all(pdf_data)?;
+        tmp_file.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::bail!("写入 PDF 数据失败 \"{}\"：{}", out_path.display(), e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, out_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        let hint = if matches!(e.raw_os_error(), Some(5) | Some(32)) {
+            "（请检查同名 PDF 是否正被阅读器打开占用，或输出目录是否有写入权限）"
+        } else {
+            ""
+        };
+        anyhow::bail!("无法写入 \"{}\"：{}{}", out_path.display(), e, hint);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,31 +440,21 @@ mod tests {
 
     #[test]
     fn test_webtoon_dimension_cap_under_14400_pt() {
-        let max_dim = 28800.0_f32;
-        let mut page_w = 800.0_f32;
-        let mut page_h = max_dim;
-        let mut draw_w = 800.0_f32;
-        let mut draw_h = max_dim;
-        let mut off_x = 0.0_f32;
-        let mut off_y = 0.0_f32;
+        let layout = compute_page_layout(PageSizeMode::Original, 800.0, 28800.0, 0.0);
+        assert_eq!(layout.page_h, 14400.0);
+        assert_eq!(layout.page_w, 400.0);
+        assert_eq!(layout.draw_h, 14400.0);
+        assert_eq!(layout.draw_w, 400.0);
+        assert_eq!(layout.off_x, 0.0);
+        assert_eq!(layout.off_y, 0.0);
+    }
 
-        const MAX_PDF_PAGE_PT: f32 = 14400.0;
-        let dim = page_w.max(page_h);
-        if dim > MAX_PDF_PAGE_PT {
-            let downscale = MAX_PDF_PAGE_PT / dim;
-            page_w *= downscale;
-            page_h *= downscale;
-            draw_w *= downscale;
-            draw_h *= downscale;
-            off_x *= downscale;
-            off_y *= downscale;
-        }
-
-        assert_eq!(page_h, 14400.0);
-        assert_eq!(page_w, 400.0);
-        assert_eq!(draw_h, 14400.0);
-        assert_eq!(draw_w, 400.0);
-        assert_eq!(off_x, 0.0);
-        assert_eq!(off_y, 0.0);
+    #[test]
+    fn test_fit_a4_clamps_excessive_margin_within_page_bounds() {
+        let layout = compute_page_layout(PageSizeMode::FitA4, 800.0, 1200.0, 1000.0);
+        assert!(layout.off_x >= 0.0);
+        assert!(layout.off_y >= 0.0);
+        assert!(layout.off_x + layout.draw_w <= layout.page_w + 1e-2);
+        assert!(layout.off_y + layout.draw_h <= layout.page_h + 1e-2);
     }
 }

@@ -3,7 +3,9 @@ use crate::source;
 use eframe::egui::{self, Align, Color32, FontId, Layout, Rounding, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub struct MangaPdfApp {
@@ -36,6 +38,8 @@ pub struct MangaPdfApp {
     preview_texture: Option<(usize, Option<egui::TextureHandle>)>,
     preview_actual_size: bool,
     preview_loading_id: Option<usize>,
+    preview_pending: Arc<Mutex<Option<(ImageEntry, u32)>>>,
+    preview_worker_active: Arc<AtomicBool>,
     preview_receiver: Receiver<(usize, Result<egui::ColorImage, String>)>,
     preview_sender: Sender<(usize, Result<egui::ColorImage, String>)>,
 }
@@ -129,6 +133,8 @@ impl MangaPdfApp {
             preview_texture: None,
             preview_actual_size: false,
             preview_loading_id: None,
+            preview_pending: Arc::new(Mutex::new(None)),
+            preview_worker_active: Arc::new(AtomicBool::new(false)),
             preview_receiver: prev_rx,
             preview_sender: prev_tx,
         };
@@ -215,9 +221,12 @@ impl MangaPdfApp {
                 self.preview_texture = None;
                 self.preview_image_idx = None;
                 self.preview_loading_id = None;
+                *self
+                    .preview_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
             }
         }
-        trim_process_memory();
     }
 
     fn add_paths_to_current_sequence(&mut self, paths: Vec<PathBuf>) {
@@ -715,6 +724,11 @@ impl MangaPdfApp {
                 .is_some_and(|item| item.id == loaded_id);
 
             if is_current {
+                if let Ok(mut pending) = self.preview_pending.lock() {
+                    if pending.as_ref().is_some_and(|(e, _)| e.id == loaded_id) {
+                        *pending = None;
+                    }
+                }
                 let tex = match res {
                     Ok(color_img) => Some(ctx.load_texture(
                         "large_preview_texture",
@@ -1085,16 +1099,10 @@ impl MangaPdfApp {
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("页面边距:").color(theme.text_muted));
-                            let mut margin_str = active_seq.margin_mm.to_string();
-                            let resp = ui.add_sized(
+                            ui.add_sized(
                                 [56.0, 22.0],
-                                egui::TextEdit::singleline(&mut margin_str),
+                                egui::DragValue::new(&mut active_seq.margin_mm).range(0..=50),
                             );
-                            if resp.changed() {
-                                if let Ok(val) = margin_str.parse::<u32>() {
-                                    active_seq.margin_mm = val;
-                                }
-                            }
                             ui.label(
                                 egui::RichText::new("mm (0为无边框)")
                                     .font(FontId::proportional(11.0))
@@ -1489,25 +1497,59 @@ impl MangaPdfApp {
                                         .show(ui, |ui| {
                                             ui.set_width(card_inner_w);
                                             ui.vertical_centered(|ui| {
-                                                let img_resp = if let Some(texture) =
+                                                let box_size = Vec2::new(card_inner_w, 154.0);
+                                                let (img_rect, img_resp) = ui
+                                                    .allocate_exact_size(
+                                                        box_size,
+                                                        egui::Sense::click(),
+                                                    );
+                                                if img_resp.hovered() {
+                                                    ui.ctx().set_cursor_icon(
+                                                        egui::CursorIcon::PointingHand,
+                                                    );
+                                                }
+                                                if let Some(texture) =
                                                     self.texture_cache.get(&item.id)
                                                 {
-                                                    let img_btn = egui::ImageButton::new((
+                                                    let tex_size = texture.size_vec2();
+                                                    let scale = (box_size.x / tex_size.x.max(1.0))
+                                                        .min(box_size.y / tex_size.y.max(1.0));
+                                                    let draw_size = tex_size * scale;
+                                                    let draw_rect = egui::Rect::from_center_size(
+                                                        img_rect.center(),
+                                                        draw_size,
+                                                    );
+                                                    ui.painter().image(
                                                         texture.id(),
-                                                        Vec2::new(card_inner_w, 154.0),
-                                                    ))
-                                                    .frame(false);
-                                                    ui.add(img_btn)
-                                                } else {
-                                                    ui.allocate_response(
-                                                        Vec2::new(card_inner_w, 154.0),
-                                                        egui::Sense::click(),
-                                                    )
-                                                };
+                                                        draw_rect,
+                                                        egui::Rect::from_min_max(
+                                                            egui::pos2(0.0, 0.0),
+                                                            egui::pos2(1.0, 1.0),
+                                                        ),
+                                                        Color32::WHITE,
+                                                    );
+                                                    if img_resp.hovered() {
+                                                        ui.painter().rect_stroke(
+                                                            draw_rect.expand(1.0),
+                                                            Rounding::same(3.0),
+                                                            Stroke::new(
+                                                                1.5_f32,
+                                                                theme.primary_color,
+                                                            ),
+                                                        );
+                                                    }
+                                                }
 
-                                                let img_resp = img_resp.on_hover_text(
-                                                    "🔍 左键点击放大预览 · 右键打开快捷菜单",
-                                                );
+                                                let hover_tip = if item.sort_key != item.name {
+                                                    format!(
+                                                        "{}\n🔍 左键点击放大预览 · 右键打开快捷菜单",
+                                                        item.sort_key
+                                                    )
+                                                } else {
+                                                    "🔍 左键点击放大预览 · 右键打开快捷菜单"
+                                                        .to_string()
+                                                };
+                                                let img_resp = img_resp.on_hover_text(hover_tip);
                                                 if img_resp.clicked() {
                                                     preview_action = Some(idx);
                                                 }
@@ -1797,6 +1839,74 @@ impl MangaPdfApp {
         }
     }
 
+    /// 将最新预览解码请求推入单工作线程队列：
+    /// 快速连续切页时自动覆盖旧请求，最多仅运行 1 个解码线程，且通过 catch_unwind 杜绝异常死锁转圈。
+    fn enqueue_preview_decode(&mut self, ctx: &egui::Context, item: ImageEntry, max_dim: u32) {
+        {
+            let mut guard = self
+                .preview_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some((item, max_dim));
+        }
+
+        if self
+            .preview_worker_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let pending = Arc::clone(&self.preview_pending);
+            let worker_active = Arc::clone(&self.preview_worker_active);
+            let tx = self.preview_sender.clone();
+            let ctx_clone = ctx.clone();
+
+            thread::spawn(move || loop {
+                let next_task = {
+                    let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(task) = guard.take() {
+                        task
+                    } else {
+                        worker_active.store(false, Ordering::Release);
+                        break;
+                    }
+                };
+
+                let (cur_item, limit_dim) = next_task;
+                let item_id = cur_item.id;
+                let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cur_item
+                        .get_bytes()
+                        .and_then(|bytes| {
+                            crate::img::decode_oriented(&bytes).map_err(|e| e.to_string())
+                        })
+                        .map(|dyn_img| {
+                            let img_to_show =
+                                if dyn_img.width() > limit_dim || dyn_img.height() > limit_dim {
+                                    dyn_img.resize(
+                                        limit_dim,
+                                        limit_dim,
+                                        image::imageops::FilterType::CatmullRom,
+                                    )
+                                } else {
+                                    dyn_img
+                                };
+                            let rgba = img_to_show.to_rgba8();
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [rgba.width() as usize, rgba.height() as usize],
+                                &rgba,
+                            )
+                        })
+                })) {
+                    Ok(r) => r,
+                    Err(_) => Err("图片解码时发生内部异常".to_string()),
+                };
+
+                let _ = tx.send((item_id, res));
+                ctx_clone.request_repaint();
+            });
+        }
+    }
+
     fn render_preview_window(&mut self, ctx: &egui::Context, theme: &PanelTheme) {
         let Some(cur_idx) = self.preview_image_idx else {
             return;
@@ -1807,6 +1917,10 @@ impl MangaPdfApp {
             self.preview_image_idx = None;
             self.preview_texture = None;
             self.preview_loading_id = None;
+            *self
+                .preview_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             return;
         }
 
@@ -1820,35 +1934,9 @@ impl MangaPdfApp {
         let cached_id = self.preview_texture.as_ref().map(|(id, _)| *id);
         if cached_id != Some(item_id) && self.preview_loading_id != Some(item_id) {
             self.preview_loading_id = Some(item_id);
-            let tx = self.preview_sender.clone();
             let gpu_max = ctx.input(|i| i.max_texture_side);
             let max_dim = (gpu_max as u32).clamp(1024, 8192);
-
-            thread::spawn(move || {
-                let res = cur_item
-                    .get_bytes()
-                    .and_then(|bytes| {
-                        crate::img::decode_oriented(&bytes).map_err(|e| e.to_string())
-                    })
-                    .map(|dyn_img| {
-                        let img_to_show = if dyn_img.width() > max_dim || dyn_img.height() > max_dim
-                        {
-                            dyn_img.resize(
-                                max_dim,
-                                max_dim,
-                                image::imageops::FilterType::CatmullRom,
-                            )
-                        } else {
-                            dyn_img
-                        };
-                        let rgba = img_to_show.to_rgba8();
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            [rgba.width() as usize, rgba.height() as usize],
-                            &rgba,
-                        )
-                    });
-                let _ = tx.send((item_id, res));
-            });
+            self.enqueue_preview_decode(ctx, cur_item, max_dim);
         }
 
         let mut close_preview = false;
@@ -2000,7 +2088,10 @@ impl MangaPdfApp {
             self.preview_image_idx = None;
             self.preview_texture = None;
             self.preview_loading_id = None;
-            trim_process_memory();
+            *self
+                .preview_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 }
@@ -2169,29 +2260,49 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 
     let trimmed = sanitized.trim_matches(|c: char| c.is_whitespace() || c == '.');
-    let base = if trimmed.is_empty() {
+    // 限制文件名最大字符长度，避免深层输出目录叠加超长轻小说/漫画标题超出 Windows MAX_PATH (260)
+    const MAX_FILENAME_CHARS: usize = 160;
+    let mut base = if trimmed.is_empty() {
         "未命名分卷".to_string()
+    } else if trimmed.chars().count() > MAX_FILENAME_CHARS {
+        let has_pdf_ext = trimmed.to_ascii_lowercase().ends_with(".pdf");
+        let stem_part = if has_pdf_ext {
+            &trimmed[..trimmed.len() - 4]
+        } else {
+            trimmed
+        };
+        let limit = if has_pdf_ext {
+            MAX_FILENAME_CHARS - 4
+        } else {
+            MAX_FILENAME_CHARS
+        };
+        let short_stem: String = stem_part.chars().take(limit).collect();
+        let clean_stem = short_stem.trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+        if clean_stem.is_empty() {
+            "未命名分卷".to_string()
+        } else if has_pdf_ext {
+            format!("{}.pdf", clean_stem)
+        } else {
+            clean_stem.to_string()
+        }
     } else {
         trimmed.to_string()
     };
 
     // 过滤 Windows 保留设备名 (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
-    let stem = if base.to_ascii_lowercase().ends_with(".pdf") {
-        &base[..base.len() - 4]
-    } else {
-        &base
-    };
+    // Windows 对多级后缀 (如 CON.vol1.pdf) 或点号前带空格 (如 "CON .pdf") 同样视为设备名，需取首个 '.' 之前并 trim 比对
+    let first_seg = base.split('.').next().unwrap_or(&base).trim();
 
     const RESERVED_NAMES: &[&str] = &[
         "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
         "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     ];
 
-    if RESERVED_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
-        format!("_{}", base)
-    } else {
-        base
+    if RESERVED_NAMES.contains(&first_seg.to_ascii_lowercase().as_str()) {
+        base.insert(0, '_');
     }
+
+    base
 }
 
 /// 针对 Windows 进程主动修剪工作集内存，将启动阶段显卡驱动预分配的大量非活跃编译缓存归还系统
@@ -2213,3 +2324,26 @@ pub fn trim_process_memory() {
 
 #[cfg(not(target_os = "windows"))]
 pub fn trim_process_memory() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename_reserved_and_special_cases() {
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("con.pdf"), "_con.pdf");
+        assert_eq!(sanitize_filename("CON.vol1.pdf"), "_CON.vol1.pdf");
+        assert_eq!(sanitize_filename("NUL .pdf"), "_NUL .pdf");
+        assert_eq!(
+            sanitize_filename("第1话: 命运? <上>"),
+            "第1话： 命运？ 《上》"
+        );
+        assert_eq!(sanitize_filename("   ...   "), "未命名分卷");
+
+        let very_long = format!("{}.pdf", "漫".repeat(250));
+        let sanitized = sanitize_filename(&very_long);
+        assert!(sanitized.ends_with(".pdf"));
+        assert!(sanitized.chars().count() <= 160);
+    }
+}

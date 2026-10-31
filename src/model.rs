@@ -23,10 +23,34 @@ impl PageSizeMode {
     }
 }
 
+/// ZIP 条目读取时的安全预分配容量上限 (64 MB)，防止损坏归档伪造超大头部触发进程级 OOM Abort
+pub const MAX_ZIP_PREALLOC_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 按路径分段进行自然语义比较（解决直接拼接路径比较时 `\` 与空格/连字符 ASCII 顺序反转，以及多章节同名图片交错问题）
+pub fn compare_natural_path_str(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_iter = a.split(['/', '\\']).filter(|s| !s.is_empty());
+    let mut b_iter = b.split(['/', '\\']).filter(|s| !s.is_empty());
+    loop {
+        match (a_iter.next(), b_iter.next()) {
+            (Some(sa), Some(sb)) => {
+                let cmp = natord::compare_ignore_case(sa, sb);
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, None) => return a.cmp(b),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ImageEntry {
     pub id: usize,
     pub name: String,
+    /// 自然排序键（保留子目录相对路径，如 `Ch01/001.jpg`，确保跨章节重排不乱序）
+    pub sort_key: String,
     pub source_path: Option<PathBuf>,
     pub archive_source: Option<(Arc<PathBuf>, String)>,
     pub bytes: Arc<[u8]>,
@@ -49,7 +73,8 @@ impl ImageEntry {
             let mut zip_file = archive
                 .by_name(entry_name)
                 .map_err(|e| format!("归档中找不到图片 {}: {}", entry_name, e))?;
-            let mut buf = Vec::with_capacity(zip_file.size() as usize);
+            let cap = zip_file.size().min(MAX_ZIP_PREALLOC_BYTES) as usize;
+            let mut buf = Vec::with_capacity(cap);
             zip_file
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("读取归档内图片 {} 失败: {}", entry_name, e))?;
@@ -110,7 +135,7 @@ impl Sequence {
 
     pub fn natural_sort(&mut self) {
         self.items
-            .sort_by(|a, b| natord::compare_ignore_case(&a.name, &b.name));
+            .sort_by(|a, b| compare_natural_path_str(&a.sort_key, &b.sort_key));
     }
 
     pub fn remove_at(&mut self, idx: usize) {

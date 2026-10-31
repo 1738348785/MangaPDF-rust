@@ -103,9 +103,11 @@ pub fn create_image_entry(
         Arc::from(bytes)
     };
 
+    let sort_key = name.clone();
     ImageEntry {
         id,
         name,
+        sort_key,
         source_path,
         archive_source,
         bytes: stored_bytes,
@@ -190,10 +192,17 @@ fn exif_orientation(exif_seg: &[u8]) -> Option<u8> {
     let num_entries = read_u16(ifd_offset)? as usize;
 
     for i in 0..num_entries.min(64) {
-        let entry_offset = ifd_offset + 2 + i * 12;
+        let Some(entry_offset) = ifd_offset.checked_add(2 + i * 12) else {
+            break;
+        };
         let tag = read_u16(entry_offset)?;
         if tag == 0x0112 {
-            let orientation = read_u16(entry_offset + 8)?;
+            let field_type = read_u16(entry_offset + 2)?;
+            let orientation = match field_type {
+                3 => read_u16(entry_offset + 8)? as u32, // SHORT (u16)
+                4 => read_u32(entry_offset + 8)?,        // LONG (u32)
+                _ => read_u16(entry_offset + 8)? as u32,
+            };
             return (1..=8).contains(&orientation).then_some(orientation as u8);
         }
     }
@@ -205,8 +214,9 @@ fn parse_jpeg_header(data: &[u8]) -> Result<JpegInfo> {
     let mut cursor = 2;
     let mut has_adobe_app14 = false;
     let mut orientation = 1u8;
+    let mut sof_info: Option<(f32, f32, u8, u8)> = None;
 
-    while cursor + 4 <= data.len() {
+    while cursor + 2 <= data.len() {
         if data[cursor] != 0xFF {
             cursor += 1;
             continue;
@@ -223,12 +233,13 @@ fn parse_jpeg_header(data: &[u8]) -> Result<JpegInfo> {
         let marker = data[cursor];
         cursor += 1;
 
-        if marker == 0xD8
-            || marker == 0xD9
-            || (0xD0..=0xD7).contains(&marker)
-            || marker == 0x00
-            || marker == 0x01
-        {
+        // 遇到 SOS (开始扫描熵数据) 或 EOI (主图结束) 立即停止：
+        // 既避免扫描正文压缩数据或误读尾部 MPF/UltraHDR 增益图的副图 SOF，又能完整捕获 SOS 前的所有 APP1/APP14 段
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+
+        if marker == 0xD8 || (0xD0..=0xD7).contains(&marker) || marker == 0x00 || marker == 0x01 {
             continue;
         }
 
@@ -255,9 +266,14 @@ fn parse_jpeg_header(data: &[u8]) -> Result<JpegInfo> {
             has_adobe_app14 = true;
         }
 
+        // 非标准 DCT (无损/差分/算术编码 SOF) 不支持 PDF DCTDecode 直通，回退解码重封装
+        if sof_info.is_none() && matches!(marker, 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+            anyhow::bail!("不支持非常规编码 JPEG 的无损直通");
+        }
+
         let is_sof = matches!(marker, 0xC0..=0xC2);
 
-        if is_sof && seg.len() >= 6 {
+        if is_sof && sof_info.is_none() && seg.len() >= 6 {
             let precision = seg[0];
             if precision != 8 {
                 anyhow::bail!("不支持非 8-bit 精度的 JPEG 直通");
@@ -269,33 +285,37 @@ fn parse_jpeg_header(data: &[u8]) -> Result<JpegInfo> {
             if width <= 0.0 || height <= 0.0 {
                 anyhow::bail!("无效的 JPEG 宽高尺寸");
             }
-
-            // 仅 Adobe (Photoshop) 写出的 CMYK JPEG 以反相形式存储，需要 Decode [1 0 ...] 还原；
-            // 不带 APP14 标记的 CMYK JPEG 按常规值存储，不能反相
-            let (color_space, invert_cmyk) = match components {
-                1 => (ColorSpace::DeviceGray, false),
-                3 => (ColorSpace::DeviceRgb, false),
-                4 => (ColorSpace::DeviceCmyk, has_adobe_app14),
-                _ => anyhow::bail!("不支持的 JPEG 通道数: {}", components),
-            };
-
-            return Ok(JpegInfo {
-                width,
-                height,
-                color_space,
-                bits_per_component: precision,
-                invert_cmyk,
-                orientation,
-            });
+            sof_info = Some((width, height, precision, components));
         }
 
         cursor += length;
     }
 
+    if let Some((width, height, precision, components)) = sof_info {
+        // 仅 Adobe (Photoshop) 写出的 CMYK JPEG 以反相形式存储，需要 Decode [1 0 ...] 还原；
+        // 不带 APP14 标记的 CMYK JPEG 按常规值存储，不能反相
+        let (color_space, invert_cmyk) = match components {
+            1 => (ColorSpace::DeviceGray, false),
+            3 => (ColorSpace::DeviceRgb, false),
+            4 => (ColorSpace::DeviceCmyk, has_adobe_app14),
+            _ => anyhow::bail!("不支持的 JPEG 通道数: {}", components),
+        };
+
+        return Ok(JpegInfo {
+            width,
+            height,
+            color_space,
+            bits_per_component: precision,
+            invert_cmyk,
+            orientation,
+        });
+    }
+
     anyhow::bail!("无法在 JPEG 中解析到有效的 SOF Marker")
 }
 
-/// 将解码后的图像统一转换为无透明通道的 8-bit 灰度或 RGB 像素缓冲 (透明像素与纯白背景 255 混合)
+/// 将解码后的图像统一转换为无透明通道的 8-bit 灰度或 RGB 像素缓冲 (透明像素与纯白背景 255 混合)。
+/// 若 RGB/RGBA 图像的所有像素均满足 R == G == B（常见于被存为 3 通道的黑白漫画），自动无损降为单通道 DeviceGray，体积缩减约 2/3。
 fn flatten_to_white(dynamic_img: image::DynamicImage) -> (ColorSpace, Vec<u8>) {
     let width = dynamic_img.width() as usize;
     let height = dynamic_img.height() as usize;
@@ -317,28 +337,47 @@ fn flatten_to_white(dynamic_img: image::DynamicImage) -> (ColorSpace, Vec<u8>) {
         image::ColorType::Rgba8 | image::ColorType::Rgba16 => {
             let rgba = dynamic_img.into_rgba8();
             let mut rgb = Vec::with_capacity(width * height * 3);
+            let mut all_gray = true;
             for pixel in rgba.pixels() {
                 let a = pixel[3] as u32;
-                if a == 255 {
-                    rgb.push(pixel[0]);
-                    rgb.push(pixel[1]);
-                    rgb.push(pixel[2]);
+                let (r, g, b) = if a == 255 {
+                    (pixel[0], pixel[1], pixel[2])
                 } else if a == 0 {
-                    rgb.push(255);
-                    rgb.push(255);
-                    rgb.push(255);
+                    (255, 255, 255)
                 } else {
-                    let r = (pixel[0] as u32 * a + 255 * (255 - a)) / 255;
-                    let g = (pixel[1] as u32 * a + 255 * (255 - a)) / 255;
-                    let b = (pixel[2] as u32 * a + 255 * (255 - a)) / 255;
-                    rgb.push(r as u8);
-                    rgb.push(g as u8);
-                    rgb.push(b as u8);
+                    let r = ((pixel[0] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                    let g = ((pixel[1] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                    let b = ((pixel[2] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                    (r, g, b)
+                };
+                if all_gray && (r != g || r != b) {
+                    all_gray = false;
                 }
+                rgb.push(r);
+                rgb.push(g);
+                rgb.push(b);
             }
-            (ColorSpace::DeviceRgb, rgb)
+            if all_gray {
+                let gray: Vec<u8> = rgb.into_iter().step_by(3).collect();
+                (ColorSpace::DeviceGray, gray)
+            } else {
+                (ColorSpace::DeviceRgb, rgb)
+            }
         }
-        _ => (ColorSpace::DeviceRgb, dynamic_img.into_rgb8().into_raw()),
+        _ => {
+            let rgb = dynamic_img.into_rgb8().into_raw();
+            let all_gray = rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|&[r, g, b]| r == g && r == b);
+            if all_gray {
+                let gray: Vec<u8> = rgb.into_iter().step_by(3).collect();
+                (ColorSpace::DeviceGray, gray)
+            } else {
+                (ColorSpace::DeviceRgb, rgb)
+            }
+        }
     }
 }
 
@@ -398,7 +437,7 @@ mod tests {
     #[test]
     fn test_png_detection_and_flate_compression() {
         let mut png_bytes = Vec::new();
-        let img = image::RgbImage::new(10, 10);
+        let img = image::RgbImage::from_fn(10, 10, |x, _| image::Rgb([x as u8 * 20, 100, 200]));
         img.write_to(
             &mut std::io::Cursor::new(&mut png_bytes),
             image::ImageFormat::Png,
@@ -412,6 +451,23 @@ mod tests {
         assert_eq!(processed.filter, Filter::FlateDecode);
         assert_eq!(processed.color_space, ColorSpace::DeviceRgb);
         assert!(!processed.stream_data.is_empty());
+    }
+
+    #[test]
+    fn test_all_gray_rgb_losslessly_compacts_to_device_gray() {
+        let mut png_bytes = Vec::new();
+        let img = image::RgbImage::from_fn(12, 12, |x, y| {
+            let v = ((x + y) * 10) as u8;
+            image::Rgb([v, v, v])
+        });
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let processed = decode_and_compress_flate(&png_bytes).unwrap();
+        assert_eq!(processed.color_space, ColorSpace::DeviceGray);
     }
 
     /// 生成 w×h 的 RGB JPEG，并可选在 SOI 之后插入带 Orientation 标签的 EXIF APP1 段
