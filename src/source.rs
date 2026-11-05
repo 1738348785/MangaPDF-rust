@@ -1,5 +1,7 @@
 use crate::img::create_image_entry;
-use crate::model::{compare_natural_path_str, ImageEntry, MAX_ZIP_PREALLOC_BYTES};
+use crate::model::{
+    compare_natural_path_str, compute_relative_sort_keys, ImageEntry, MAX_ZIP_PREALLOC_BYTES,
+};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs::{self, File};
@@ -54,13 +56,17 @@ pub fn collect_image_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
             }
         }
     } else {
-        // 递归模式：扫描所有子目录（完全忠实执行用户指令，仅跳过系统隐藏文件夹）
+        // 递归模式：扫描所有子目录（完全忠实执行用户指令，仅跳过系统隐藏文件夹与符号链接目录防死循环）
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current_dir) = stack.pop() {
             if let Ok(entries) = fs::read_dir(&current_dir) {
                 for entry in entries.flatten() {
+                    let is_symlink = entry.file_type().is_ok_and(|ft| ft.is_symlink());
                     let path = entry.path();
                     if path.is_dir() {
+                        if is_symlink {
+                            continue;
+                        }
                         let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
                         if !is_system_hidden_dir(&dir_name) {
                             stack.push(path);
@@ -101,41 +107,6 @@ pub fn compare_natural_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
             (None, None) => return a.cmp(b),
         }
     }
-}
-
-/// 提取一组路径剥离公共祖先目录后的相对排序键（如 `Ch01/001.jpg`；单层目录则简化为 `001.jpg`）
-fn compute_relative_sort_keys(raw_paths: &[String]) -> Vec<String> {
-    if raw_paths.is_empty() {
-        return Vec::new();
-    }
-    let split_all: Vec<Vec<&str>> = raw_paths
-        .iter()
-        .map(|p| p.split(['/', '\\']).filter(|s| !s.is_empty()).collect())
-        .collect();
-
-    let first_dirs = &split_all[0][..split_all[0].len().saturating_sub(1)];
-    let mut common_len = first_dirs.len();
-    for segs in &split_all[1..] {
-        let dirs = &segs[..segs.len().saturating_sub(1)];
-        common_len = common_len.min(dirs.len());
-        for i in 0..common_len {
-            if !first_dirs[i].eq_ignore_ascii_case(dirs[i]) && first_dirs[i] != dirs[i] {
-                common_len = i;
-                break;
-            }
-        }
-    }
-
-    split_all
-        .into_iter()
-        .map(|segs| {
-            if common_len < segs.len() {
-                segs[common_len..].join("/")
-            } else {
-                segs.last().copied().unwrap_or_default().to_string()
-            }
-        })
-        .collect()
 }
 
 /// 从文件路径列表中加载图片 (按自然语言自然排序，支持分批并发与进度回调)
@@ -241,14 +212,33 @@ where
     ))
 }
 
+/// 快速探测当前目录根一级是否直接包含至少一张有效图片
+pub fn dir_has_root_images(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let p = e.path();
+                p.is_file()
+                    && p.extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(is_image_extension)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// 快速探测目录树中是否存在至少一张有效图片（找到即短路返回，避免重复全量遍历排序）
 fn dir_has_any_image(dir: &Path) -> bool {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
         if let Ok(entries) = fs::read_dir(&current_dir) {
             for entry in entries.flatten() {
+                let is_symlink = entry.file_type().is_ok_and(|ft| ft.is_symlink());
                 let path = entry.path();
                 if path.is_dir() {
+                    if is_symlink {
+                        continue;
+                    }
                     let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
                     if !is_system_hidden_dir(&dir_name) {
                         stack.push(path);
@@ -438,6 +428,50 @@ mod tests {
         assert_eq!(
             compute_relative_sort_keys(&single_dir),
             vec!["001.jpg", "002.jpg"]
+        );
+    }
+
+    #[test]
+    fn test_multi_batch_append_natural_sort_keeps_chapters_ordered() {
+        use crate::model::Sequence;
+        use std::sync::Arc;
+
+        let make_entry = |id: usize, path_str: &str| {
+            let p = PathBuf::from(path_str);
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            ImageEntry {
+                id,
+                name: name.clone(),
+                // 模拟分批导入时单批内部剥离目录后仅剩文件名
+                sort_key: name,
+                source_path: Some(p),
+                archive_source: None,
+                bytes: Arc::from(&[][..]),
+                width: 100,
+                height: 100,
+                thumb_rgb: None,
+                thumb_width: 0,
+                thumb_height: 0,
+            }
+        };
+
+        let mut seq = Sequence::new(1, "合集".to_string());
+        seq.items.push(make_entry(1, r"E:\Manga\Ch02\001.jpg"));
+        seq.items.push(make_entry(2, r"E:\Manga\Ch01\002.jpg"));
+        seq.items.push(make_entry(3, r"E:\Manga\Ch02\002.jpg"));
+        seq.items.push(make_entry(4, r"E:\Manga\Ch01\001.jpg"));
+
+        seq.natural_sort();
+
+        let sorted_keys: Vec<&str> = seq.items.iter().map(|i| i.sort_key.as_str()).collect();
+        assert_eq!(
+            sorted_keys,
+            vec![
+                "Ch01/001.jpg",
+                "Ch01/002.jpg",
+                "Ch02/001.jpg",
+                "Ch02/002.jpg"
+            ]
         );
     }
 }

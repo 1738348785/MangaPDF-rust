@@ -82,7 +82,7 @@ pub fn create_image_entry(
     let mut thumb_w = 0;
     let mut thumb_h = 0;
 
-    // 生成轻量 UI 缩略图 (最大 100x140 像素以维持极低内存占用；按 EXIF 方向校正)
+    // 生成轻量 UI 缩略图 (最大 100x140 像素以维持极低内存占用；按 EXIF 方向校正，保留 RGBA 透明通道)
     // 优先完整解码以直接提取真实方向与尺寸；仅在解码失败时才回退至快速头解析 blob_size
     if let Ok(dyn_img) = decode_oriented(&bytes) {
         width = dyn_img.width();
@@ -90,7 +90,7 @@ pub fn create_image_entry(
         let thumb = dyn_img.thumbnail(100, 140);
         thumb_w = thumb.width() as usize;
         thumb_h = thumb.height() as usize;
-        thumb_rgb = Some(Arc::from(thumb.into_rgb8().into_raw()));
+        thumb_rgb = Some(Arc::from(thumb.into_rgba8().into_raw()));
     } else if let Ok(size) = imagesize::blob_size(&bytes) {
         width = size.width as u32;
         height = size.height as u32;
@@ -562,5 +562,29 @@ mod tests {
         let adobe = parse_jpeg_header(&cmyk_header(true)).unwrap();
         assert_eq!(adobe.color_space, ColorSpace::DeviceCmyk);
         assert!(adobe.invert_cmyk, "Adobe CMYK JPEG 需要反相 Decode");
+    }
+
+    #[test]
+    fn test_thumbnail_preserves_rgba_alpha_channel() {
+        let mut png_bytes = Vec::new();
+        let img = image::RgbaImage::from_fn(8, 8, |x, _| {
+            if x < 4 {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([255, 0, 0, 255])
+            }
+        });
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let entry = create_image_entry(1, "alpha.png".into(), png_bytes, None, None);
+        let rgba = entry.thumb_rgb.as_ref().expect("应生成 RGBA 缩略图");
+        assert_eq!(rgba.len(), entry.thumb_width * entry.thumb_height * 4);
+        assert_eq!(rgba[3], 0, "左边缘透明像素应保留 Alpha = 0");
+        let right_edge_alpha = rgba[(entry.thumb_width - 1) * 4 + 3];
+        assert_eq!(right_edge_alpha, 255, "右边缘不透明像素应保留 Alpha = 255");
     }
 }

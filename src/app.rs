@@ -77,6 +77,7 @@ enum TaskMessage {
         total_files: usize,
         failed_errors: Vec<String>,
         skipped: Vec<String>,
+        last_output_path: Option<PathBuf>,
     },
     Error(String),
 }
@@ -241,37 +242,75 @@ impl MangaPdfApp {
         let tx = self.task_sender.clone();
 
         spawn_guarded(tx.clone(), "导入", move || {
-            let final_paths = if scan_sub && paths.len() == 1 && paths[0].is_dir() {
-                let single_dir = &paths[0];
-                let subfolders = source::get_direct_subfolders(single_dir);
-                // 检查根目录下是否直接存在散落图片
-                let root_has_images = std::fs::read_dir(single_dir)
-                    .map(|entries| {
-                        entries.flatten().any(|e| {
-                            let p = e.path();
-                            p.is_file()
-                                && p.extension()
-                                    .and_then(|s| s.to_str())
-                                    .is_some_and(source::is_image_extension)
-                        })
-                    })
-                    .unwrap_or(false);
+            // 展开待导入的目录列表：(目标目录, 是否递归扫描其子目录)
+            // - 开启「包含子文件夹图片」(scan_sub == true)：每个所选文件夹均作为单个分卷递归汇总其下所有子目录图片；
+            // - 关闭「包含子文件夹图片」(默认)：
+            //   1. 若文件夹根目录直接含有图片，仅导入根目录一级图片（自动忽略蒙版/翻译缓存子目录）；
+            //   2. 若根目录无直接图片但含多个有效子文件夹，自动识别为漫画合集总目录并拆分为多个独立分卷；
+            //   3. 若根目录无直接图片且仅有单层包装子目录，自动递归提取内部图片，避免报错“未找到有效图片”。
+            let mut expanded_dirs: Vec<(PathBuf, bool)> = Vec::new();
+            let mut non_dirs: Vec<PathBuf> = Vec::new();
 
-                if !root_has_images && subfolders.len() > 1 {
-                    // 自动识别为整套漫画合集目录，拆分为多个独立分卷
-                    subfolders
+            for p in paths {
+                if p.is_dir() {
+                    if scan_sub {
+                        expanded_dirs.push((p, true));
+                    } else if source::dir_has_root_images(&p) {
+                        expanded_dirs.push((p, false));
+                    } else {
+                        let subfolders = source::get_direct_subfolders(&p);
+                        if subfolders.len() > 1 {
+                            for sub in subfolders {
+                                let sub_rec = !source::dir_has_root_images(&sub);
+                                expanded_dirs.push((sub, sub_rec));
+                            }
+                        } else {
+                            expanded_dirs.push((p, true));
+                        }
+                    }
                 } else {
-                    paths
+                    non_dirs.push(p);
                 }
-            } else {
-                paths
-            };
+            }
 
             let mut groups = Vec::new();
             let mut loose_images = Vec::new();
             let mut errors: Vec<String> = Vec::new();
 
-            for p in final_paths {
+            for (p, recursive) in expanded_dirs {
+                let seq_name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let progress_tx = tx.clone();
+                let label = seq_name.clone();
+                let cb = move |current: usize, total: usize, name: &str| {
+                    let _ = progress_tx.send(TaskMessage::Progress {
+                        current,
+                        total,
+                        desc: format!(
+                            "正在导入文件夹 {} [{}/{}]: {}",
+                            label, current, total, name
+                        ),
+                    });
+                };
+                match source::load_entries_from_folder_with_progress(&p, 0, recursive, Some(&cb)) {
+                    Ok((entries, errs)) => {
+                        errors.extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
+                        if !entries.is_empty() {
+                            groups.push(ImportedGroup {
+                                seq_name: Some(seq_name),
+                                out_dir: p.parent().map(|d| d.to_path_buf()),
+                                entries,
+                            });
+                        }
+                    }
+                    Err(e) => errors.push(format!("[{}] {:#}", seq_name, e)),
+                }
+            }
+
+            for p in non_dirs {
                 if source::is_archive(&p) {
                     let seq_name = p
                         .file_stem()
@@ -291,39 +330,6 @@ impl MangaPdfApp {
                         });
                     };
                     match source::load_entries_from_archive_with_progress(&p, 0, Some(&cb)) {
-                        Ok((entries, errs)) => {
-                            errors
-                                .extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
-                            if !entries.is_empty() {
-                                groups.push(ImportedGroup {
-                                    seq_name: Some(seq_name),
-                                    out_dir: p.parent().map(|d| d.to_path_buf()),
-                                    entries,
-                                });
-                            }
-                        }
-                        Err(e) => errors.push(format!("[{}] {:#}", seq_name, e)),
-                    }
-                } else if p.is_dir() {
-                    let seq_name = p
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let progress_tx = tx.clone();
-                    let label = seq_name.clone();
-                    let cb = move |current: usize, total: usize, name: &str| {
-                        let _ = progress_tx.send(TaskMessage::Progress {
-                            current,
-                            total,
-                            desc: format!(
-                                "正在导入文件夹 {} [{}/{}]: {}",
-                                label, current, total, name
-                            ),
-                        });
-                    };
-                    match source::load_entries_from_folder_with_progress(&p, 0, scan_sub, Some(&cb))
-                    {
                         Ok((entries, errs)) => {
                             errors
                                 .extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
@@ -516,6 +522,7 @@ impl MangaPdfApp {
             let mut failed_errors = Vec::new();
             let mut skipped_all = Vec::new();
             let mut used_paths = HashSet::new();
+            let mut last_output_path = None;
 
             for (idx, seq) in sequences.into_iter().enumerate() {
                 let out_dir = seq.output_dir.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -558,6 +565,7 @@ impl MangaPdfApp {
                 match crate::pdf::build_pdf_from_sequence(&seq, &final_path, Some(cb)) {
                     Ok(report) => {
                         success_total += 1;
+                        last_output_path = Some(final_path);
                         skipped_all.extend(
                             report
                                 .skipped
@@ -575,6 +583,7 @@ impl MangaPdfApp {
                 total_files: success_total,
                 failed_errors,
                 skipped: skipped_all,
+                last_output_path,
             });
         });
     }
@@ -618,7 +627,9 @@ impl MangaPdfApp {
                                 current.output_dir = group.out_dir;
                             }
                             current.items.extend(group.entries);
-                            // 保留用户已手动调好的顺序，新散图已在导入阶段完成自然排序
+                            // 保留用户已手动调好的顺序，新散图已在导入阶段完成自然排序；
+                            // 同时基于分卷内全部条目的源路径重算相对 sort_key，确保跨批次导入多话散图后仍能保留章节层级
+                            current.refresh_sort_keys();
                         }
                     }
 
@@ -633,6 +644,7 @@ impl MangaPdfApp {
                     };
                     self.set_status(msg, is_err, errors);
                     self.cleanup_stale_textures();
+                    trim_process_memory();
                 }
                 TaskMessage::Finished {
                     success_count,
@@ -660,15 +672,19 @@ impl MangaPdfApp {
                         );
                     }
                     self.cleanup_stale_textures();
+                    trim_process_memory();
                 }
                 TaskMessage::BatchFinished {
                     total_files,
                     failed_errors,
                     skipped,
+                    last_output_path,
                 } => {
                     self.is_generating = false;
                     self.progress = 1.0;
-                    self.last_output_path = self.current_sequence().output_dir.clone();
+                    if let Some(out_path) = last_output_path {
+                        self.last_output_path = Some(out_path);
+                    }
                     let skipped_note = if skipped.is_empty() {
                         String::new()
                     } else {
@@ -705,11 +721,13 @@ impl MangaPdfApp {
                         );
                     }
                     self.cleanup_stale_textures();
+                    trim_process_memory();
                 }
                 TaskMessage::Error(err) => {
                     self.is_generating = false;
                     self.is_importing = false;
                     self.set_status(err, true, Vec::new());
+                    trim_process_memory();
                 }
             }
         }
@@ -1037,7 +1055,7 @@ impl MangaPdfApp {
                         })
                         .response
                         .on_hover_text(
-                            "开启：导入时递归扫描子文件夹内全部图片\n关闭：仅导入根目录下的一级图片（自动忽略蒙版/翻译缓存等子目录）",
+                            "开启：将所选文件夹及其所有子文件夹内的图片合并导入到同一分卷\n关闭：优先仅导入根目录一级图片（忽略蒙版/翻译缓存等子目录）；若根目录无图片且含多个子目录，则自动按子目录拆分为多个分卷",
                         );
 
                         ui.add_space(8.0);
@@ -1255,8 +1273,15 @@ impl MangaPdfApp {
                                 format!("{} (点击切换)", seq.name)
                             };
                             let resp = ui.add(btn).on_hover_text(hover_tip);
-                            if resp.clicked() {
+                            if resp.clicked() && self.active_sequence_idx != idx {
                                 self.active_sequence_idx = idx;
+                                self.preview_image_idx = None;
+                                self.preview_texture = None;
+                                self.preview_loading_id = None;
+                                *self
+                                    .preview_pending
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = None;
                             }
                             if self.sequences.len() > 1 {
                                 resp.context_menu(|ui| {
@@ -1447,8 +1472,8 @@ impl MangaPdfApp {
                 })
                 .collect();
 
-            for (id, w, h, rgb) in needed_textures {
-                let color_image = egui::ColorImage::from_rgb([w, h], &rgb);
+            for (id, w, h, rgba) in needed_textures {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                 let texture = ctx.load_texture(
                     format!("thumb_{}", id),
                     color_image,
@@ -1538,6 +1563,34 @@ impl MangaPdfApp {
                                                             ),
                                                         );
                                                     }
+                                                } else {
+                                                    let placeholder_bg = if theme.is_dark {
+                                                        Color32::from_rgb(17, 24, 39)
+                                                    } else {
+                                                        Color32::from_rgb(243, 244, 246)
+                                                    };
+                                                    ui.painter().rect_filled(
+                                                        img_rect,
+                                                        Rounding::same(4.0),
+                                                        placeholder_bg,
+                                                    );
+                                                    let border_color = if img_resp.hovered() {
+                                                        theme.primary_color
+                                                    } else {
+                                                        theme.border_stroke.color
+                                                    };
+                                                    ui.painter().rect_stroke(
+                                                        img_rect,
+                                                        Rounding::same(4.0),
+                                                        Stroke::new(1.0_f32, border_color),
+                                                    );
+                                                    ui.painter().text(
+                                                        img_rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        "⚠ 无法预览",
+                                                        FontId::proportional(11.0),
+                                                        theme.text_muted,
+                                                    );
                                                 }
 
                                                 let hover_tip = if item.sort_key != item.name {
@@ -1921,6 +1974,7 @@ impl MangaPdfApp {
                 .preview_pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
+            trim_process_memory();
             return;
         }
 
@@ -1932,11 +1986,14 @@ impl MangaPdfApp {
         let total_pages = current_seq.items.len();
 
         let cached_id = self.preview_texture.as_ref().map(|(id, _)| *id);
-        if cached_id != Some(item_id) && self.preview_loading_id != Some(item_id) {
-            self.preview_loading_id = Some(item_id);
-            let gpu_max = ctx.input(|i| i.max_texture_side);
-            let max_dim = (gpu_max as u32).clamp(1024, 8192);
-            self.enqueue_preview_decode(ctx, cur_item, max_dim);
+        if cached_id != Some(item_id) {
+            self.preview_texture = None;
+            if self.preview_loading_id != Some(item_id) {
+                self.preview_loading_id = Some(item_id);
+                let gpu_max = ctx.input(|i| i.max_texture_side);
+                let max_dim = (gpu_max as u32).clamp(1024, 8192);
+                self.enqueue_preview_decode(ctx, cur_item, max_dim);
+            }
         }
 
         let mut close_preview = false;
@@ -1968,11 +2025,15 @@ impl MangaPdfApp {
             .collapsible(false)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                // 快捷键支持：← 上一页，→ 下一页，Esc 关闭
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && cur_idx > 0 {
+                // 快捷键支持：← 上一页，→ 下一页，Esc 关闭（文本框聚焦输入时不拦截方向键）
+                let kb_free = !ctx.wants_keyboard_input();
+                if kb_free && ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && cur_idx > 0 {
                     switch_idx = Some(cur_idx.saturating_sub(1));
                 }
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur_idx + 1 < total_pages {
+                if kb_free
+                    && ui.input(|i| i.key_pressed(egui::Key::ArrowRight))
+                    && cur_idx + 1 < total_pages
+                {
                     switch_idx = Some(cur_idx + 1);
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2092,6 +2153,7 @@ impl MangaPdfApp {
                 .preview_pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
+            trim_process_memory();
         }
     }
 }
@@ -2259,7 +2321,18 @@ pub fn sanitize_filename(name: &str) -> String {
         }
     }
 
-    let trimmed = sanitized.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    let end_trimmed = sanitized.trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+    let is_empty_pdf_ext = end_trimmed
+        .get(end_trimmed.len().saturating_sub(4)..)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(".pdf"))
+        && end_trimmed[..end_trimmed.len() - 4]
+            .trim_matches(|c: char| c.is_whitespace() || c == '.')
+            .is_empty();
+    let trimmed = if is_empty_pdf_ext {
+        ""
+    } else {
+        end_trimmed.trim_start_matches(|c: char| c.is_whitespace() || c == '.')
+    };
     // 限制文件名最大字符长度，避免深层输出目录叠加超长轻小说/漫画标题超出 Windows MAX_PATH (260)
     const MAX_FILENAME_CHARS: usize = 160;
     let mut base = if trimmed.is_empty() {
@@ -2340,6 +2413,9 @@ mod tests {
             "第1话： 命运？ 《上》"
         );
         assert_eq!(sanitize_filename("   ...   "), "未命名分卷");
+        assert_eq!(sanitize_filename(".pdf"), "未命名分卷");
+        assert_eq!(sanitize_filename("   .PDF "), "未命名分卷");
+        assert_eq!(sanitize_filename("...pdf"), "未命名分卷");
 
         let very_long = format!("{}.pdf", "漫".repeat(250));
         let sanitized = sanitize_filename(&very_long);

@@ -26,6 +26,41 @@ impl PageSizeMode {
 /// ZIP 条目读取时的安全预分配容量上限 (64 MB)，防止损坏归档伪造超大头部触发进程级 OOM Abort
 pub const MAX_ZIP_PREALLOC_BYTES: u64 = 64 * 1024 * 1024;
 
+/// 提取一组路径剥离公共祖先目录后的相对排序键（如 `Ch01/001.jpg`；单层目录则简化为 `001.jpg`）
+pub fn compute_relative_sort_keys(raw_paths: &[String]) -> Vec<String> {
+    if raw_paths.is_empty() {
+        return Vec::new();
+    }
+    let split_all: Vec<Vec<&str>> = raw_paths
+        .iter()
+        .map(|p| p.split(['/', '\\']).filter(|s| !s.is_empty()).collect())
+        .collect();
+
+    let first_dirs = &split_all[0][..split_all[0].len().saturating_sub(1)];
+    let mut common_len = first_dirs.len();
+    for segs in &split_all[1..] {
+        let dirs = &segs[..segs.len().saturating_sub(1)];
+        common_len = common_len.min(dirs.len());
+        for i in 0..common_len {
+            if !first_dirs[i].eq_ignore_ascii_case(dirs[i]) {
+                common_len = i;
+                break;
+            }
+        }
+    }
+
+    split_all
+        .into_iter()
+        .map(|segs| {
+            if common_len < segs.len() {
+                segs[common_len..].join("/")
+            } else {
+                segs.last().copied().unwrap_or_default().to_string()
+            }
+        })
+        .collect()
+}
+
 /// 按路径分段进行自然语义比较（解决直接拼接路径比较时 `\` 与空格/连字符 ASCII 顺序反转，以及多章节同名图片交错问题）
 pub fn compare_natural_path_str(a: &str, b: &str) -> std::cmp::Ordering {
     let mut a_iter = a.split(['/', '\\']).filter(|s| !s.is_empty());
@@ -133,7 +168,32 @@ impl Sequence {
         }
     }
 
+    /// 基于分卷内所有条目的完整源路径重新计算相对 `sort_key`（解决分批次追加不同章节散图时目录层级被单批剥离的问题）
+    pub fn refresh_sort_keys(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let raw_paths: Vec<String> = self
+            .items
+            .iter()
+            .map(|item| {
+                if let Some(p) = &item.source_path {
+                    p.to_string_lossy().into_owned()
+                } else if let Some((arch, entry_name)) = &item.archive_source {
+                    format!("{}/{}", arch.to_string_lossy(), entry_name)
+                } else {
+                    item.sort_key.clone()
+                }
+            })
+            .collect();
+        let keys = compute_relative_sort_keys(&raw_paths);
+        for (item, key) in self.items.iter_mut().zip(keys) {
+            item.sort_key = key;
+        }
+    }
+
     pub fn natural_sort(&mut self) {
+        self.refresh_sort_keys();
         self.items
             .sort_by(|a, b| compare_natural_path_str(&a.sort_key, &b.sort_key));
     }
