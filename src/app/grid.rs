@@ -236,6 +236,11 @@ impl MangaPdfApp {
 
             ui.add_space(10.0);
 
+            // 工具栏里的「清空全部」可能就在同一帧把条目清空，
+            // 这里必须重新读取实时长度：若继续用上面那次读取的 total_items，
+            // 就会拿旧长度去切片一个已经变空的 Vec，触发 range end index out of range 的 panic（表现为点一下窗口就没了）。
+            let total_items = self.current_sequence().items.len();
+
             // 虚拟滚动缩略图网格 或 空状态占位（仅渲染可视行并按需懒加载 GPU 纹理，数千页仍保持流畅）
             if total_items == 0 {
                 ui.add_space(60.0);
@@ -275,11 +280,15 @@ impl MangaPdfApp {
                         .id_salt("image_cards_scroll")
                         .auto_shrink([false, false])
                         .show_rows(ui, CARD_OUTER_H, total_rows, |ui, row_range| {
+                            // 每帧按实时长度裁剪区间，杜绝任何"本帧中途条目被清空"导致的切片越界
+                            let item_count = self.current_sequence().items.len();
+
                             // 1. 仅按当前可见区间 + 上下缓冲行按需上传缩略图纹理到 GPU
-                            let prefetch_start =
-                                row_range.start.saturating_sub(PREFETCH_BUFFER_ROWS) * cols;
-                            let prefetch_end =
-                                ((row_range.end + PREFETCH_BUFFER_ROWS) * cols).min(total_items);
+                            let prefetch_start = (row_range.start.saturating_sub(PREFETCH_BUFFER_ROWS)
+                                * cols)
+                                .min(item_count);
+                            let prefetch_end = ((row_range.end + PREFETCH_BUFFER_ROWS) * cols)
+                                .min(item_count);
 
                             if prefetch_start < prefetch_end {
                                 let needed_textures: Vec<(usize, usize, usize, Arc<[u8]>)> = self
@@ -313,10 +322,11 @@ impl MangaPdfApp {
 
                             // 2. 当显存纹理缓存超过上限时，淘汰远离当前视口的纹理，严控超大单行本显存峰值
                             if self.texture_cache.len() > MAX_CACHED_TEXTURES {
-                                let keep_start =
-                                    row_range.start.saturating_sub(KEEP_BUFFER_ROWS) * cols;
-                                let keep_end =
-                                    ((row_range.end + KEEP_BUFFER_ROWS) * cols).min(total_items);
+                                let keep_start = (row_range.start.saturating_sub(KEEP_BUFFER_ROWS)
+                                    * cols)
+                                    .min(item_count);
+                                let keep_end = ((row_range.end + KEEP_BUFFER_ROWS) * cols)
+                                    .min(item_count);
                                 let keep_ids: HashSet<usize> = self.current_sequence().items
                                     [keep_start..keep_end]
                                     .iter()
@@ -328,7 +338,7 @@ impl MangaPdfApp {
                             // 3. 仅构建当前视口内的卡片行
                             for row in row_range {
                                 let start_idx = row * cols;
-                                let end_idx = (start_idx + cols).min(total_items);
+                                let end_idx = (start_idx + cols).min(item_count);
                                 if start_idx >= end_idx {
                                     break;
                                 }
