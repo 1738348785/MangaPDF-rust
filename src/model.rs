@@ -80,6 +80,15 @@ pub fn compare_natural_path_str(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// ZIP/CBZ 归档内的条目引用：通过精确的条目索引读取字节（彻底规避非 UTF-8 文件名匹配问题），
+/// 同时保留已按正确编码解码的逻辑路径用于自然排序与界面展示。
+#[derive(Clone)]
+pub struct ArchiveEntryRef {
+    pub archive_path: Arc<PathBuf>,
+    pub entry_index: usize,
+    pub decoded_path: String,
+}
+
 #[derive(Clone)]
 pub struct ImageEntry {
     pub id: usize,
@@ -87,32 +96,34 @@ pub struct ImageEntry {
     /// 自然排序键（保留子目录相对路径，如 `Ch01/001.jpg`，确保跨章节重排不乱序）
     pub sort_key: String,
     pub source_path: Option<PathBuf>,
-    pub archive_source: Option<(Arc<PathBuf>, String)>,
+    pub archive_source: Option<ArchiveEntryRef>,
     pub bytes: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
     pub thumb_rgb: Option<Arc<[u8]>>,
     pub thumb_width: usize,
     pub thumb_height: usize,
+    /// 缩略图生成失败的原因；用于在网格占位符的提示里直接说明，而不是只显示"无缩略图"
+    pub thumb_error: Option<String>,
 }
 
 impl ImageEntry {
     pub fn get_bytes(&self) -> Result<Vec<u8>, String> {
         if let Some(path) = &self.source_path {
             std::fs::read(path).map_err(|e| format!("无法读取图片文件 {}: {}", path.display(), e))
-        } else if let Some((archive_path, entry_name)) = &self.archive_source {
-            let file = std::fs::File::open(archive_path.as_ref())
-                .map_err(|e| format!("无法打开归档文件 {}: {}", archive_path.display(), e))?;
+        } else if let Some(arch) = &self.archive_source {
+            let file = std::fs::File::open(arch.archive_path.as_ref())
+                .map_err(|e| format!("无法打开归档文件 {}: {}", arch.archive_path.display(), e))?;
             let mut archive = zip::ZipArchive::new(file)
-                .map_err(|e| format!("无法解析归档 {}: {}", archive_path.display(), e))?;
+                .map_err(|e| format!("无法解析归档 {}: {}", arch.archive_path.display(), e))?;
             let mut zip_file = archive
-                .by_name(entry_name)
-                .map_err(|e| format!("归档中找不到图片 {}: {}", entry_name, e))?;
+                .by_index(arch.entry_index)
+                .map_err(|e| format!("归档中找不到图片 {}: {}", arch.decoded_path, e))?;
             let cap = zip_file.size().min(MAX_ZIP_PREALLOC_BYTES) as usize;
             let mut buf = Vec::with_capacity(cap);
             zip_file
                 .read_to_end(&mut buf)
-                .map_err(|e| format!("读取归档内图片 {} 失败: {}", entry_name, e))?;
+                .map_err(|e| format!("读取归档内图片 {} 失败: {}", arch.decoded_path, e))?;
             Ok(buf)
         } else {
             Ok(self.bytes.to_vec())
@@ -179,8 +190,8 @@ impl Sequence {
             .map(|item| {
                 if let Some(p) = &item.source_path {
                     p.to_string_lossy().into_owned()
-                } else if let Some((arch, entry_name)) = &item.archive_source {
-                    format!("{}/{}", arch.to_string_lossy(), entry_name)
+                } else if let Some(arch) = &item.archive_source {
+                    format!("{}/{}", arch.archive_path.to_string_lossy(), arch.decoded_path)
                 } else {
                     item.sort_key.clone()
                 }

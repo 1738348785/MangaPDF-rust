@@ -13,8 +13,16 @@ if ($LASTEXITCODE -eq 0) {
     Start-Sleep -Milliseconds 300
     Copy-Item "target\release\pdf_tool.exe" "MangaPDF.exe" -Force
     Copy-Item "target\release\pdf_tool.exe" "MangaPDF-rust.exe" -Force
-    icacls "MangaPDF.exe" /setintegritylevel Medium | Out-Null
-    icacls "MangaPDF-rust.exe" /setintegritylevel Medium | Out-Null
+    # 固定完整性级别为 Medium 需要提升权限；未提权时新生成的文件本就是 Medium，跳过以免输出误导性的 "Access is denied"
+    $isElevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+    if ($isElevated) {
+        icacls "MangaPDF.exe" /setintegritylevel Medium | Out-Null
+        icacls "MangaPDF-rust.exe" /setintegritylevel Medium | Out-Null
+    } else {
+        Write-Host "  [info] 未以管理员身份运行：跳过完整性级别固定（默认即为 Medium）" -ForegroundColor DarkGray
+    }
     if (Test-Path "pdf_tool.exe") {
         Remove-Item "pdf_tool.exe" -Force
     }

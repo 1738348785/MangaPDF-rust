@@ -5,6 +5,13 @@ fn main() {
 
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/app_icon.ico");
+        res.set("ProductName", "MangaPDF");
+        res.set(
+            "FileDescription",
+            "MangaPDF - Modern Comic & Image to PDF Packaging Tool",
+        );
+        res.set("OriginalFilename", "MangaPDF.exe");
+        res.set("InternalName", "MangaPDF");
 
         // 若使用 GNU 工具链且 PATH 中未直接找到 windres，智能探测常见安装路径作为后备
         if std::env::var("TARGET").is_ok_and(|t| t.contains("gnu"))

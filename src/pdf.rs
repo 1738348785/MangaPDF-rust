@@ -1,11 +1,30 @@
 use crate::img::{ColorSpace, Filter};
-use crate::model::{PageSizeMode, Sequence};
+use crate::model::{ImageEntry, PageSizeMode, Sequence};
 use anyhow::Result;
 use pdf_writer::{Content, Filter as PdfFilter, Finish, Name, Pdf, Rect, Ref};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 任务被用户主动取消时返回的哨兵错误类型
+#[derive(Debug)]
+pub struct CancelledError;
+
+impl std::fmt::Display for CancelledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "任务已取消")
+    }
+}
+
+impl std::error::Error for CancelledError {}
+
+#[inline]
+fn is_cancelled(cancel_flag: Option<&AtomicBool>) -> bool {
+    cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
 
 /// PDF 生成结果：成功写入的页数 + 被跳过的图片 (文件名: 原因)
 pub struct BuildReport {
@@ -113,80 +132,79 @@ pub fn orientation_matrix(
     }
 }
 
-/// 为当前批次批量提取原始图片字节。
-/// 若批次中存在来自同一 ZIP/CBZ 归档的多张图片，一次性打开归档并连续读取，避免多线程重复解析中央目录。
-fn fetch_chunk_bytes(chunk: &[crate::model::ImageEntry]) -> Vec<Result<Vec<u8>, String>> {
-    let mut results: Vec<Option<Result<Vec<u8>, String>>> =
-        (0..chunk.len()).map(|_| None).collect();
-    use std::collections::BTreeMap;
-    let mut archive_groups: BTreeMap<std::path::PathBuf, Vec<(usize, String)>> = BTreeMap::new();
-
-    for (idx, item) in chunk.iter().enumerate() {
-        if let Some(path) = &item.source_path {
-            results[idx] = Some(
-                std::fs::read(path)
-                    .map_err(|e| format!("无法读取图片文件 {}: {}", path.display(), e)),
-            );
-        } else if let Some((archive_path, entry_name)) = &item.archive_source {
-            archive_groups
-                .entry((**archive_path).clone())
-                .or_default()
-                .push((idx, entry_name.clone()));
-        } else {
-            results[idx] = Some(Ok(item.bytes.to_vec()));
-        }
-    }
-
-    for (archive_path, entries) in archive_groups {
-        match std::fs::File::open(&archive_path) {
-            Ok(file) => match zip::ZipArchive::new(file) {
-                Ok(mut archive) => {
-                    for (idx, entry_name) in entries {
-                        match archive.by_name(&entry_name) {
-                            Ok(mut zip_file) => {
-                                let cap = zip_file.size().min(crate::model::MAX_ZIP_PREALLOC_BYTES)
-                                    as usize;
-                                let mut buf = Vec::with_capacity(cap);
-                                use std::io::Read;
-                                match zip_file.read_to_end(&mut buf) {
-                                    Ok(_) => results[idx] = Some(Ok(buf)),
-                                    Err(e) => {
-                                        results[idx] = Some(Err(format!(
-                                            "读取归档内图片 {} 失败: {}",
-                                            entry_name, e
-                                        )))
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                results[idx] =
-                                    Some(Err(format!("归档中找不到图片 {}: {}", entry_name, e)))
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let err_msg = format!("无法解析归档 {}: {}", archive_path.display(), e);
-                    for (idx, _) in entries {
-                        results[idx] = Some(Err(err_msg.clone()));
-                    }
-                }
-            },
-            Err(e) => {
-                let err_msg = format!("无法打开归档文件 {}: {}", archive_path.display(), e);
-                for (idx, _) in entries {
-                    results[idx] = Some(Err(err_msg.clone()));
-                }
-            }
-        }
-    }
-
-    results
-        .into_iter()
-        .map(|opt| opt.unwrap_or_else(|| Err("未知读取错误".to_string())))
-        .collect()
+/// 跨批次复用的 ZIP/CBZ 归档读取缓存，避免每 32 页重复打开文件并重新解析中央目录
+struct ArchiveReaderCache {
+    readers: HashMap<PathBuf, Result<zip::ZipArchive<File>, String>>,
 }
 
+impl ArchiveReaderCache {
+    fn new() -> Self {
+        Self {
+            readers: HashMap::new(),
+        }
+    }
+
+    fn read_entry(
+        &mut self,
+        archive_path: &Path,
+        entry_index: usize,
+        decoded_path: &str,
+    ) -> Result<Vec<u8>, String> {
+        let entry = self
+            .readers
+            .entry(archive_path.to_path_buf())
+            .or_insert_with(|| {
+                let file = File::open(archive_path).map_err(|e| {
+                    format!("无法打开归档文件 {}: {}", archive_path.display(), e)
+                })?;
+                zip::ZipArchive::new(file)
+                    .map_err(|e| format!("无法解析归档 {}: {}", archive_path.display(), e))
+            });
+
+        let archive = match entry {
+            Ok(arch) => arch,
+            Err(err_msg) => return Err(err_msg.clone()),
+        };
+
+        let mut zip_file = archive
+            .by_index(entry_index)
+            .map_err(|e| format!("归档中找不到图片 {}: {}", decoded_path, e))?;
+        let cap = zip_file.size().min(crate::model::MAX_ZIP_PREALLOC_BYTES) as usize;
+        let mut buf = Vec::with_capacity(cap);
+        zip_file
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("读取归档内图片 {} 失败: {}", decoded_path, e))?;
+        Ok(buf)
+    }
+}
+
+type ChunkArchiveBytes = Vec<Option<Result<Vec<u8>, String>>>;
+
+/// 为当前批次预读归档条目字节（复用已打开的 ZipArchive 句柄）；
+/// 本地磁盘文件留给 Rayon 线程池并行读取，既发挥并发 I/O 又能进一步减少批次缓冲占用。
+fn prefetch_chunk_archive_bytes(
+    chunk: &[ImageEntry],
+    archive_cache: &mut ArchiveReaderCache,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<ChunkArchiveBytes> {
+    let mut out = Vec::with_capacity(chunk.len());
+    for item in chunk {
+        if is_cancelled(cancel_flag) {
+            return Err(CancelledError.into());
+        }
+        let fetched = item.archive_source.as_ref().map(|arch| {
+            archive_cache.read_entry(
+                arch.archive_path.as_ref(),
+                arch.entry_index,
+                &arch.decoded_path,
+            )
+        });
+        out.push(fetched);
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
 pub fn build_pdf_from_sequence<P, F>(
     sequence: &Sequence,
     output_path: P,
@@ -196,8 +214,24 @@ where
     P: AsRef<Path>,
     F: Fn(usize, usize, &str) + Send + Sync,
 {
+    build_pdf_from_sequence_with_cancel(sequence, output_path, progress_callback, None)
+}
+
+pub fn build_pdf_from_sequence_with_cancel<P, F>(
+    sequence: &Sequence,
+    output_path: P,
+    progress_callback: Option<F>,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<BuildReport>
+where
+    P: AsRef<Path>,
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     if sequence.items.is_empty() {
         anyhow::bail!("序列中没有任何图片");
+    }
+    if is_cancelled(cancel_flag) {
+        return Err(CancelledError.into());
     }
 
     let mut pdf = Pdf::new();
@@ -212,20 +246,43 @@ where
 
     let margin_pt = (sequence.margin_mm as f32) * (72.0 / 25.4); // mm 转 point (1 inch = 25.4mm = 72pt)
 
-    // 分批多核并行转码 (每批 32 张，充分释放多核性能且将内存峰值严格控制在几十兆内)
+    // 分批多核并行转码，整卷复用 ZIP/CBZ 归档句柄避免每批重复解析中央目录
     const CHUNK_SIZE: usize = 32;
     let processed_counter = std::sync::atomic::AtomicUsize::new(0);
+    let mut archive_cache = ArchiveReaderCache::new();
 
     for chunk in sequence.items.chunks(CHUNK_SIZE) {
-        let chunk_bytes = fetch_chunk_bytes(chunk);
+        if is_cancelled(cancel_flag) {
+            return Err(CancelledError.into());
+        }
+        let prefetched_archives =
+            prefetch_chunk_archive_bytes(chunk, &mut archive_cache, cancel_flag)?;
         let processed_chunk: Vec<Result<crate::img::ProcessedImage>> = chunk
             .par_iter()
-            .zip(chunk_bytes)
-            .map(|(item, raw_bytes_res)| {
+            .zip(prefetched_archives)
+            .map(|(item, archive_bytes_opt)| {
+                if is_cancelled(cancel_flag) {
+                    return Err(CancelledError.into());
+                }
+                let raw_bytes_res = match archive_bytes_opt {
+                    Some(res) => res,
+                    None => {
+                        if let Some(path) = &item.source_path {
+                            std::fs::read(path).map_err(|e| {
+                                format!("无法读取图片文件 {}: {}", path.display(), e)
+                            })
+                        } else {
+                            Ok(item.bytes.to_vec())
+                        }
+                    }
+                };
                 let raw_bytes = match raw_bytes_res {
                     Ok(b) => b,
                     Err(e) => return Err(anyhow::anyhow!(e)),
                 };
+                if is_cancelled(cancel_flag) {
+                    return Err(CancelledError.into());
+                }
                 let res = crate::img::process_image_bytes(
                     raw_bytes,
                     sequence.lossless_direct,
@@ -240,7 +297,15 @@ where
             })
             .collect();
 
+        if is_cancelled(cancel_flag) {
+            return Err(CancelledError.into());
+        }
+
         for (item, res) in chunk.iter().zip(processed_chunk) {
+            // 逐页检查取消：此前只在每个批次前后检查，点「取消」后最多还要再写完 32 页才有反应
+            if is_cancelled(cancel_flag) {
+                return Err(CancelledError.into());
+            }
             let processed = match res {
                 Ok(img) => img,
                 Err(e) => {
@@ -273,9 +338,29 @@ where
                 image_xobj.decode([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
             }
             match processed.filter {
-                Filter::DctDecode => image_xobj.filter(PdfFilter::DctDecode),
-                Filter::FlateDecode => image_xobj.filter(PdfFilter::FlateDecode),
-            };
+                Filter::DctDecode => {
+                    image_xobj.filter(PdfFilter::DctDecode);
+                    if let Some(ct) = processed.dct_color_transform {
+                        image_xobj.decode_parms().color_transform(ct);
+                    }
+                }
+                Filter::FlateDecode => {
+                    image_xobj.filter(PdfFilter::FlateDecode);
+                    if processed.flate_predictor {
+                        let colors = match processed.color_space {
+                            ColorSpace::DeviceGray => 1,
+                            ColorSpace::DeviceRgb => 3,
+                            ColorSpace::DeviceCmyk => 4,
+                        };
+                        image_xobj
+                            .decode_parms()
+                            .predictor(pdf_writer::types::Predictor::PngOptimum)
+                            .colors(colors)
+                            .bits_per_component(processed.bits_per_component as i32)
+                            .columns(processed.width as i32);
+                    }
+                }
+            }
             image_xobj.finish();
 
             // 2. 根据页面尺寸模式计算页面宽高与图片变换矩阵 (使用按 EXIF 方向校正后的显示尺寸)
@@ -338,6 +423,10 @@ where
     }
     catalog.finish();
 
+    if is_cancelled(cancel_flag) {
+        return Err(CancelledError.into());
+    }
+
     let pdf_data = pdf.finish();
     write_pdf_atomically(output_path.as_ref(), &pdf_data)?;
 
@@ -368,8 +457,8 @@ fn write_pdf_atomically(out_path: &Path, pdf_data: &[u8]) -> Result<()> {
 
     static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = out_path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp_path = parent.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), seq));
+    // 使用简短固定前缀的临时文件名，避免原文件名达 160 字符时在深层目录下超出 Windows MAX_PATH (260)
+    let tmp_path = parent.join(format!(".mangapdf_{}_{}.tmp", std::process::id(), seq));
 
     let write_res = (|| -> std::io::Result<()> {
         let mut tmp_file = File::create(&tmp_path)?;
@@ -456,5 +545,178 @@ mod tests {
         assert!(layout.off_y >= 0.0);
         assert!(layout.off_x + layout.draw_w <= layout.page_w + 1e-2);
         assert!(layout.off_y + layout.draw_h <= layout.page_h + 1e-2);
+    }
+
+    #[test]
+    fn test_pdf_flate_image_writes_png_predictor_decode_parms() {
+        let mut png_bytes = Vec::new();
+        let img = image::RgbImage::from_fn(24, 16, |x, y| {
+            image::Rgb([(x * 8) as u8, (y * 12) as u8, 120])
+        });
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let entry = crate::img::create_image_entry(1, "page1.png".into(), png_bytes, None, None);
+        let mut seq = Sequence::new(1, "predictor_test".into());
+        seq.items.push(entry);
+
+        let out_path = std::env::temp_dir().join(format!(
+            "mangapdf_predictor_test_{}.pdf",
+            std::process::id()
+        ));
+        let report =
+            build_pdf_from_sequence(&seq, &out_path, None::<fn(usize, usize, &str)>).unwrap();
+        assert_eq!(report.pages, 1);
+        assert!(report.skipped.is_empty());
+
+        let pdf_bytes = std::fs::read(&out_path).unwrap();
+        let _ = std::fs::remove_file(&out_path);
+        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(pdf_text.contains("/Filter /FlateDecode"));
+        assert!(pdf_text.contains("/DecodeParms"));
+        assert!(pdf_text.contains("/Predictor 15"));
+        assert!(pdf_text.contains("/Colors 3"));
+        assert!(pdf_text.contains("/Columns 24"));
+    }
+
+    #[test]
+    fn test_pdf_multi_chunk_zip_archive_reuses_reader() {
+        use std::sync::Arc;
+        use zip::write::SimpleFileOptions;
+
+        let mut png_bytes = Vec::new();
+        let img = image::GrayImage::from_fn(12, 12, |x, y| image::Luma([(x + y) as u8 * 8]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "mangapdf_multichunk_test_{}.cbz",
+            std::process::id()
+        ));
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip_writer = zip::ZipWriter::new(file);
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // 40 页 > CHUNK_SIZE (32)，验证跨批次复用归档句柄
+            for i in 1..=40usize {
+                zip_writer
+                    .start_file(format!("{:03}.png", i), opts)
+                    .unwrap();
+                zip_writer.write_all(&png_bytes).unwrap();
+            }
+            zip_writer.finish().unwrap();
+        }
+
+        let arch_arc = Arc::new(zip_path.clone());
+        let mut seq = Sequence::new(1, "cbz_test".into());
+        for i in 1..=40usize {
+            let name = format!("{:03}.png", i);
+            seq.items.push(ImageEntry {
+                id: i,
+                name: name.clone(),
+                sort_key: name.clone(),
+                source_path: None,
+                archive_source: Some(crate::model::ArchiveEntryRef {
+                    archive_path: Arc::clone(&arch_arc),
+                    entry_index: i - 1,
+                    decoded_path: name,
+                }),
+                bytes: Arc::from(&[][..]),
+                width: 12,
+                height: 12,
+                thumb_rgb: None,
+                thumb_width: 0,
+                thumb_height: 0,
+                thumb_error: None,
+            });
+        }
+
+        let out_path = std::env::temp_dir().join(format!(
+            "mangapdf_multichunk_out_{}.pdf",
+            std::process::id()
+        ));
+        let report =
+            build_pdf_from_sequence(&seq, &out_path, None::<fn(usize, usize, &str)>).unwrap();
+        let _ = std::fs::remove_file(&zip_path);
+        let _ = std::fs::remove_file(&out_path);
+
+        assert_eq!(report.pages, 40);
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_build_pdf_respects_cancel_flag() {
+        let mut png_bytes = Vec::new();
+        let img = image::GrayImage::from_fn(8, 8, |x, _| image::Luma([x as u8 * 20]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let entry = crate::img::create_image_entry(1, "p1.png".into(), png_bytes, None, None);
+        let mut seq = Sequence::new(1, "cancel_test".into());
+        seq.items.push(entry);
+
+        let out_path = std::env::temp_dir().join(format!(
+            "mangapdf_cancel_test_{}.pdf",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&out_path);
+
+        let cancel = AtomicBool::new(true);
+        let res = build_pdf_from_sequence_with_cancel(
+            &seq,
+            &out_path,
+            None::<fn(usize, usize, &str)>,
+            Some(&cancel),
+        );
+        assert!(res.is_err());
+        assert!(res.err().unwrap().is::<CancelledError>());
+        assert!(!out_path.exists(), "取消后不应向磁盘写出任何 PDF 文件");
+    }
+
+    #[test]
+    fn test_pdf_writes_16bit_grayscale_png_without_bit_depth_loss() {
+        let img =
+            image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_fn(18, 12, |x, y| {
+                image::Luma([(x as u16 * 1234).wrapping_add(y as u16 * 77)])
+            });
+        let mut png_bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let entry = crate::img::create_image_entry(1, "page16.png".into(), png_bytes, None, None);
+        let mut seq = Sequence::new(1, "p16".into());
+        seq.items.push(entry);
+
+        let out_path = std::env::temp_dir().join(format!(
+            "mangapdf_p16_test_{}.pdf",
+            std::process::id()
+        ));
+        let report =
+            build_pdf_from_sequence(&seq, &out_path, None::<fn(usize, usize, &str)>).unwrap();
+        assert_eq!(report.pages, 1);
+        assert!(report.skipped.is_empty());
+
+        let pdf_bytes = std::fs::read(&out_path).unwrap();
+        let _ = std::fs::remove_file(&out_path);
+        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(
+            pdf_text.contains("/BitsPerComponent 16"),
+            "16-bit 灰度 PNG 必须以 16-bit 写入 PDF"
+        );
+        assert!(pdf_text.contains("/Colors 1"));
+        assert!(pdf_text.contains("/Predictor 15"));
     }
 }

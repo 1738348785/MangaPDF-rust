@@ -1,6 +1,6 @@
 [package]
 name = "pdf_tool"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 default-run = "pdf_tool"
 authors = ["1738348785"]
@@ -36,6 +36,9 @@ anyhow = "1.0"
 
 # zlib 压缩
 miniz_oxide = "0.8"
+
+# PNG IDAT 分块 CRC32 完整性校验（已在依赖图中，不增加二进制体积）
+crc32fast = "1"
 
 [build-dependencies]
 winresource = "0.1"

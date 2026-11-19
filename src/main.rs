@@ -5,6 +5,7 @@ mod img;
 mod model;
 mod pdf;
 mod source;
+mod util;
 
 use app::MangaPdfApp;
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
