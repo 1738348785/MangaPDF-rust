@@ -106,11 +106,16 @@ pub fn parent_dir_non_empty(path: &std::path::Path) -> Option<std::path::PathBuf
 
 /// 从导入文件夹路径提取非空分卷名称（兼容直接选择盘符根目录如 `D:\` 时 `file_name()` 为空的情况）
 pub fn derive_folder_sequence_name(dir: &std::path::Path) -> String {
-    // 相对路径（命令行传入的 `.` / `vol1` 等）的 `file_name()` 语义没有意义：
-    // `Path::new(".")` 的 `file_name()` 是 None，会一路掉进下面的盘符分支生成 `".盘"` 这种诡异分卷名。
-    // 先转绝对路径再取名；已有根的路径（`D:\`、`/`、UNC）保持原样，避免把盘符根变成 `E盘`+数字。
+    // 相对路径（命令行传入的 `.` / `vol1` 等）以及含 `..` 的路径的 `file_name()` 语义没有意义：
+    // `Path::new(".")`、`Path::new(r"E:\Manga\sub\..")` 的 `file_name()` 都是 None，
+    // 会一路掉进下面的盘符分支生成 `".盘"` 或 `"E:\Manga\sub\..盘"` 这种诡异分卷名。
+    // 先转绝对路径再取名；已有根且不含 `..` 的路径（`D:\`、`/`、UNC）保持原样，避免把盘符根变成 `E盘`+数字。
     let owned;
-    let dir = if dir.has_root() {
+    let dir = if dir.has_root()
+        && !dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         dir
     } else {
         owned = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -128,8 +133,10 @@ pub fn derive_folder_sequence_name(dir: &std::path::Path) -> String {
         .trim()
         .trim_end_matches(['\\', '/'])
         .trim_end_matches(':');
-    if !cleaned.is_empty() {
+    if cleaned.len() == 1 && cleaned.as_bytes()[0].is_ascii_alphabetic() {
         format!("{}盘", cleaned)
+    } else if !cleaned.is_empty() {
+        cleaned.trim_start_matches(['\\', '/']).to_string()
     } else {
         "根目录".to_string()
     }
@@ -448,25 +455,38 @@ fn score_zip_name_text(codec: ZipNameCodec, text: &str) -> i64 {
                 }
             }
             // 韩文音节只可能来自 CP949 / GB18030 / UTF-8。常见音节给足分，
-            // 冷僻音节（ㄸ/ㅃ/ㅉ 与罕见韵尾组合）反而扣分，避免 GBK 被 CP949 反向劫持
-            '\u{AC00}'..='\u{D7A3}' => {
-                if !matches!(
-                    codec,
-                    ZipNameCodec::Utf8 | ZipNameCodec::CodePage(949) | ZipNameCodec::CodePage(54936)
-                ) {
-                    -4
-                } else if is_common_hangul_syllable(ch) {
-                    7
-                } else {
-                    -1
+            // 冷僻音节（ㄸ/ㅃ/ㅉ 与罕见韵尾组合）反而扣分，避免 GBK 被 CP949 反向劫持；
+            // UTF-8 下合法 3 字节韩文几乎不可能由其它遗留编码偶然拼出，额外给足权重避免被 GBK/CP949 抢走
+            '\u{AC00}'..='\u{D7A3}' => match codec {
+                ZipNameCodec::Utf8 => {
+                    if is_common_hangul_syllable(ch) {
+                        10
+                    } else {
+                        6
+                    }
                 }
-            }
+                ZipNameCodec::CodePage(949) | ZipNameCodec::CodePage(54936) => {
+                    if is_common_hangul_syllable(ch) {
+                        7
+                    } else {
+                        -1
+                    }
+                }
+                _ => -4,
+            },
             // 韩文兼容字母 (ㄱ..ㅣ)：韩文文件名的常见成分
             '\u{3130}'..='\u{318F}' => 4,
             // 全角标点与 CJK 符号：中日韩文件名的常见成分
             '\u{3000}'..='\u{303F}' | '\u{FF01}'..='\u{FF60}' => 2,
-            // 汉字：所有中日韩代码页都能解出汉字，本身不区分对错，保持中性
-            '\u{4E00}'..='\u{9FFF}' => 0,
+            // 汉字：遗留代码页之间都能解出汉字，因此保持中性；
+            // 但 UTF-8 下每个汉字是严格的 3 字节 `1110xxxx 10xxxxxx 10xxxxxx` 序列，
+            // 遗留编码偶然拼出合法 3 字节 UTF-8 汉字的概率极低，必须给予正分，
+            // 否则未置 UTF-8 标志的纯中文 UTF-8 归档（如 "图集/001.jpg"、"完结/图精.jpg"）
+            // 会因 GBK 字节区间加分（最高可达每 2 汉字 +15 分）反超 0 分的 UTF-8 而变成乱码。
+            '\u{4E00}'..='\u{9FFF}' => match codec {
+                ZipNameCodec::Utf8 => 10,
+                _ => 0,
+            },
             // CP949 会在 GBK 字节上解出兼容区汉字，通常是误读
             '\u{F900}'..='\u{FAFF}' => {
                 if codec == ZipNameCodec::CodePage(949) {
@@ -715,6 +735,29 @@ mod tests {
             decode_zip_entry_names(&unflagged(&names)),
             vec!["第01話/表紙.png", "第01話/001.png", "第02話/目次.png"]
         );
+
+        // 连续偶数个纯汉字的未标记 UTF-8 名称（3 字节 UTF-8 按 2 字节重切后恰好全部落在合法 GBK 区间，
+        // 如 "图集" 的 `BE E9`、"图精" 的 `BE E7`/`B2 BE` 均落入 GB2312 一级字区）：
+        // 任何系统代码页下都必须识别为 UTF-8，而不能被 GBK 字节加分反杀成乱码。
+        let hanzi_pairs: [&[u8]; 3] = [
+            "图集/001.jpg".as_bytes(),
+            "完结/图精.jpg".as_bytes(),
+            "特装/附页.jpg".as_bytes(),
+        ];
+        for acp in [936u32, 932, 949, 950, 1252] {
+            for &single in &hanzi_pairs {
+                assert_eq!(
+                    decode_zip_entry_names_with_acp(&unflagged(&[single]), acp),
+                    vec![std::str::from_utf8(single).unwrap()],
+                    "ACP={acp} 时纯中文未标记 UTF-8 归档不应被 GBK 劫持"
+                );
+            }
+            assert_eq!(
+                decode_zip_entry_names_with_acp(&unflagged(&hanzi_pairs), acp),
+                vec!["图集/001.jpg", "完结/图精.jpg", "特装/附页.jpg"],
+                "ACP={acp}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -769,6 +812,9 @@ mod tests {
         assert_eq!(derive_folder_sequence_name(Path::new(r"E:\Manga\第01卷")), "第01卷");
         assert_eq!(derive_folder_sequence_name(Path::new(r"D:\")), "D盘");
         assert_eq!(derive_folder_sequence_name(Path::new("/")), "根目录");
+        assert_eq!(derive_folder_sequence_name(Path::new(r"E:\Manga\sub\..")), "Manga");
+        assert_eq!(derive_folder_sequence_name(Path::new(r"E:\Manga\..")), "E盘");
+        assert!(!derive_folder_sequence_name(Path::new(r"\\server\share")).ends_with('盘'));
 
         // 相对路径（命令行 `MangaPDF.exe .`）：旧实现会落进盘符分支生成 ".盘"
         let cwd_name = std::env::current_dir()

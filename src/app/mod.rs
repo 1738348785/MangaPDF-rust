@@ -571,11 +571,11 @@ impl eframe::App for MangaPdfApp {
         // 4. 中间主面板
         self.render_central_panel(ctx, &theme, is_busy, is_hovering_files, Some(frame));
 
-        // 5. 关于对话框
-        self.render_about_dialog(ctx, &theme);
-
-        // 6. 大图画廊预览
+        // 5. 大图画廊预览
         self.render_preview_window(ctx, &theme);
+
+        // 6. 关于对话框（置于预览窗之后渲染，确保在预览打开时点击「关于」浮于最前）
+        self.render_about_dialog(ctx, &theme);
 
         // 7. 拖拽文件悬停窗口时的视觉高亮（仅在窗口边缘勾勒一圈精致的主题色描边）
         if is_hovering_files {

@@ -45,7 +45,7 @@ impl MangaPdfApp {
                     cur_item
                         .get_bytes()
                         .and_then(|bytes| {
-                            crate::img::decode_oriented(&bytes).map_err(|e| e.to_string())
+                            crate::img::decode_oriented(&bytes).map_err(|e| format!("{:#}", e))
                         })
                         .map(|dyn_img| {
                             let img_to_show =
@@ -146,7 +146,7 @@ impl MangaPdfApp {
                 {
                     switch_idx = Some(cur_idx + 1);
                 }
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if !self.show_about_dialog && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close_preview = true;
                 }
 
@@ -179,13 +179,12 @@ impl MangaPdfApp {
                     ui.selectable_value(&mut self.preview_actual_size, true, "100% 原始尺寸");
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} × {} px · 按 Esc 退出",
-                                item_width, item_height
-                            ))
-                            .color(theme.text_muted),
-                        );
+                        let dim_text = if item_width == 0 || item_height == 0 {
+                            "尺寸未知 · 按 Esc 退出".to_string()
+                        } else {
+                            format!("{} × {} px · 按 Esc 退出", item_width, item_height)
+                        };
+                        ui.label(egui::RichText::new(dim_text).color(theme.text_muted));
                     });
                 });
 

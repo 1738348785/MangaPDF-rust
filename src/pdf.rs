@@ -273,18 +273,19 @@ where
                         }
                     }
                 };
-                let raw_bytes = match raw_bytes_res {
-                    Ok(b) => b,
-                    Err(e) => return Err(anyhow::anyhow!(e)),
+                let res = match raw_bytes_res {
+                    Ok(raw_bytes) => {
+                        if is_cancelled(cancel_flag) {
+                            return Err(CancelledError.into());
+                        }
+                        crate::img::process_image_bytes(
+                            raw_bytes,
+                            sequence.lossless_direct,
+                            sequence.quality,
+                        )
+                    }
+                    Err(e) => Err(anyhow::anyhow!(e)),
                 };
-                if is_cancelled(cancel_flag) {
-                    return Err(CancelledError.into());
-                }
-                let res = crate::img::process_image_bytes(
-                    raw_bytes,
-                    sequence.lossless_direct,
-                    sequence.quality,
-                );
                 let current_done =
                     processed_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if let Some(cb) = &progress_callback {

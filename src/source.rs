@@ -57,6 +57,28 @@ pub fn is_system_hidden_dir(name: &str) -> bool {
         || lower == "system volume information"
 }
 
+/// 检查文件名是否为应忽略的系统隐藏/元数据文件（如 macOS AppleDouble `._001.jpg`、点开头隐藏文件）
+pub fn is_ignored_file_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+/// 判断路径是否为可导入的图片文件（自动排除 `._*` 等隐藏元数据文件）
+fn is_importable_image_file(path: &Path) -> bool {
+    path.is_file()
+        && !is_ignored_file_name(path)
+        && path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(is_image_extension)
+}
+
+/// 判断路径是否为可导入的归档文件（自动排除 `._*` 等隐藏元数据文件）
+fn is_importable_archive_file(path: &Path) -> bool {
+    path.is_file() && !is_ignored_file_name(path) && is_archive(path)
+}
+
 /// 收集目录下的图片文件 (支持递归开关、取消信号与智能过滤)
 pub fn collect_image_files(
     dir: &Path,
@@ -73,12 +95,8 @@ pub fn collect_image_files(
                     return Vec::new();
                 }
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        if is_image_extension(ext) {
-                            files.push(path);
-                        }
-                    }
+                if is_importable_image_file(&path) {
+                    files.push(path);
                 }
             }
         }
@@ -104,12 +122,8 @@ pub fn collect_image_files(
                         if !is_system_hidden_dir(&dir_name) {
                             stack.push(path);
                         }
-                    } else if path.is_file() {
-                        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                            if is_image_extension(ext) {
-                                files.push(path);
-                            }
-                        }
+                    } else if is_importable_image_file(&path) {
+                        files.push(path);
                     }
                 }
             }
@@ -136,7 +150,7 @@ pub fn collect_archive_files(
                     return Vec::new();
                 }
                 let path = entry.path();
-                if path.is_file() && is_archive(&path) {
+                if is_importable_archive_file(&path) {
                     archives.push(path);
                 }
             }
@@ -162,7 +176,7 @@ pub fn collect_archive_files(
                         if !is_system_hidden_dir(&dir_name) {
                             stack.push(path);
                         }
-                    } else if path.is_file() && is_archive(&path) {
+                    } else if is_importable_archive_file(&path) {
                         archives.push(path);
                     }
                 }
@@ -200,7 +214,7 @@ pub fn collect_unsupported_media_exts_in_dir(
                             stack.push(path);
                         }
                     }
-                } else if path.is_file() {
+                } else if path.is_file() && !is_ignored_file_name(&path) {
                     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                         if is_known_unsupported_media_ext(ext) {
                             found.insert(format!(".{}", ext.to_ascii_lowercase()));
@@ -356,20 +370,12 @@ where
 /// 快速探测当前目录根一级是否直接包含至少一张有效图片
 pub fn dir_has_root_images(dir: &Path) -> bool {
     fs::read_dir(dir)
-        .map(|entries| {
-            entries.flatten().any(|e| {
-                let p = e.path();
-                p.is_file()
-                    && p.extension()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(is_image_extension)
-            })
-        })
+        .map(|entries| entries.flatten().any(|e| is_importable_image_file(&e.path())))
         .unwrap_or(false)
 }
 
 /// 快速探测目录树中是否存在至少一张有效图片（找到即短路返回，避免重复全量遍历排序）
-fn dir_has_any_image(dir: &Path, cancel_flag: Option<&AtomicBool>) -> bool {
+pub fn dir_has_any_image(dir: &Path, cancel_flag: Option<&AtomicBool>) -> bool {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
         // 「取消」在扫描阶段也必须生效：用户误拖入一个含几万个子目录的大目录时，
@@ -389,12 +395,8 @@ fn dir_has_any_image(dir: &Path, cancel_flag: Option<&AtomicBool>) -> bool {
                     if !is_system_hidden_dir(&dir_name) {
                         stack.push(path);
                     }
-                } else if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        if is_image_extension(ext) {
-                            return true;
-                        }
-                    }
+                } else if is_importable_image_file(&path) {
+                    return true;
                 }
             }
         }
@@ -402,13 +404,13 @@ fn dir_has_any_image(dir: &Path, cancel_flag: Option<&AtomicBool>) -> bool {
     false
 }
 
-/// 检查目录是否包含多个直接分卷子目录
-pub fn get_direct_subfolders(dir: &Path, cancel_flag: Option<&AtomicBool>) -> Vec<PathBuf> {
-    let mut subfolders = Vec::new();
+/// 列出目录下全部非隐藏、非符号链接的一级子目录（自然排序）
+pub fn get_direct_visible_subdirs(dir: &Path, cancel_flag: Option<&AtomicBool>) -> Vec<PathBuf> {
+    let mut subdirs = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             if is_cancelled(cancel_flag) {
-                break;
+                return Vec::new();
             }
             let path = entry.path();
             if path.is_dir() {
@@ -421,14 +423,25 @@ pub fn get_direct_subfolders(dir: &Path, cancel_flag: Option<&AtomicBool>) -> Ve
                 if is_system_hidden_dir(&dir_name) {
                     continue;
                 }
-                // 检查子目录内是否有有效图片
-                if dir_has_any_image(&path, cancel_flag) {
-                    subfolders.push(path);
-                }
+                subdirs.push(path);
             }
         }
     }
-    subfolders.sort_by(|a, b| compare_natural_paths(a, b));
+    subdirs.sort_by(|a, b| compare_natural_paths(a, b));
+    subdirs
+}
+
+/// 检查目录是否包含多个直接含图分卷子目录
+pub fn get_direct_subfolders(dir: &Path, cancel_flag: Option<&AtomicBool>) -> Vec<PathBuf> {
+    let mut subfolders = Vec::new();
+    for path in get_direct_visible_subdirs(dir, cancel_flag) {
+        if is_cancelled(cancel_flag) {
+            break;
+        }
+        if dir_has_any_image(&path, cancel_flag) {
+            subfolders.push(path);
+        }
+    }
     subfolders
 }
 
@@ -436,17 +449,34 @@ pub fn get_direct_subfolders(dir: &Path, cancel_flag: Option<&AtomicBool>) -> Ve
 /// 自动探测非 UTF-8 中文 GBK / 日文 Shift-JIS / Big5 / CP949 文件名并按条目索引精准读取，支持中途取消）
 ///
 /// 归档本身无法打开/解析时返回 Err；单个条目读取失败则跳过并记入问题列表。
+#[allow(dead_code)]
 pub fn load_entries_from_archive_with_progress<F>(
     archive_path: &Path,
-    mut start_id: usize,
+    start_id: usize,
     progress_cb: Option<&F>,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<(Vec<ImageEntry>, Vec<String>)>
 where
     F: Fn(usize, usize, &str) + Send + Sync,
 {
+    let (entries, errors, _) =
+        load_entries_from_archive_detailed(archive_path, start_id, progress_cb, cancel_flag)?;
+    Ok((entries, errors))
+}
+
+/// [`load_entries_from_archive_with_progress`] 的完整版：额外返回归档内检测到的暂不支持格式扩展名，
+/// 便于在 `.cbz` 仅含 `.avif` / `.jxl` / `.gif` 等暂不支持图片时给出清晰引导。
+pub fn load_entries_from_archive_detailed<F>(
+    archive_path: &Path,
+    mut start_id: usize,
+    progress_cb: Option<&F>,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<(Vec<ImageEntry>, Vec<String>, Vec<String>)>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     if is_cancelled(cancel_flag) {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
 
     let file = File::open(archive_path)
@@ -463,11 +493,24 @@ where
     // 说明归档自己声明了编码，必须无条件信任，否则 GBK 里「目录」「页」这种合法 UTF-8 字节会被误判。
     let mut raw_names: Vec<Vec<u8>> = Vec::with_capacity(archive.len());
     let mut name_is_utf8: Vec<bool> = Vec::with_capacity(archive.len());
+    let mut errors = Vec::new();
     for i in 0..archive.len() {
-        let zip_file = archive.by_index_raw(i)?;
-        let raw = zip_file.name_raw();
-        name_is_utf8.push(zip_file.name().as_bytes() == raw);
-        raw_names.push(raw.to_vec());
+        if is_cancelled(cancel_flag) {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        match archive.by_index_raw(i) {
+            Ok(zip_file) => {
+                let raw = zip_file.name_raw();
+                name_is_utf8.push(zip_file.name().as_bytes() == raw);
+                raw_names.push(raw.to_vec());
+            }
+            Err(e) => {
+                // 单条本地头损坏不应直接中断整包导入：用空名占位保持索引对齐并记录错误
+                errors.push(format!("条目 #{}: 无法读取归档头 ({})", i + 1, e));
+                name_is_utf8.push(true);
+                raw_names.push(Vec::new());
+            }
+        }
     }
     let entries: Vec<RawZipName<'_>> = raw_names
         .iter()
@@ -477,8 +520,9 @@ where
     let decoded_names = decode_zip_entry_names(&entries);
 
     let mut valid_entries = Vec::new();
+    let mut unsupported_exts = BTreeSet::new();
     for (i, decoded_name) in decoded_names.into_iter().enumerate() {
-        if decoded_name.ends_with('/') || decoded_name.ends_with('\\') {
+        if decoded_name.is_empty() || decoded_name.ends_with('/') || decoded_name.ends_with('\\') {
             continue;
         }
         let is_ignored = decoded_name.split(['/', '\\']).any(is_system_hidden_dir);
@@ -492,6 +536,8 @@ where
         if let Some(ext) = Path::new(file_name).extension().and_then(|s| s.to_str()) {
             if is_image_extension(ext) {
                 valid_entries.push((i, decoded_name));
+            } else if is_known_unsupported_media_ext(ext) {
+                unsupported_exts.insert(format!(".{}", ext.to_ascii_lowercase()));
             }
         }
     }
@@ -509,7 +555,6 @@ where
     let counter = std::sync::atomic::AtomicUsize::new(0);
     let archive_arc = std::sync::Arc::new(archive_path.to_path_buf());
     let mut entries = Vec::with_capacity(total);
-    let mut errors = Vec::new();
 
     for chunk in valid_with_keys.chunks(32) {
         if is_cancelled(cancel_flag) {
@@ -534,7 +579,10 @@ where
                 Ok(b) => b,
                 Err(e) => {
                     errors.push(format!("{}: 解压失败 ({})", entry_name, e));
-                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(cb) = progress_cb {
+                        cb(done, total, &display_name);
+                    }
                     continue;
                 }
             };
@@ -592,7 +640,7 @@ where
         }
     }
 
-    Ok((entries, errors))
+    Ok((entries, errors, unsupported_exts.into_iter().collect()))
 }
 
 #[cfg(test)]
@@ -866,5 +914,79 @@ mod tests {
         assert!(cancelled.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_local_folder_scans_ignore_macos_appledouble_files() {
+        let dir = std::env::temp_dir().join(format!("mangapdf_appledouble_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+
+        // 仅存在 macOS AppleDouble 假文件时，不应被视为含图目录或合法归档
+        fs::write(dir.join("._001.jpg"), b"appledouble").unwrap();
+        fs::write(dir.join(".hidden.png"), b"hidden").unwrap();
+        fs::write(dir.join("._Vol1.cbz"), b"appledouble").unwrap();
+        assert!(!dir_has_root_images(&dir));
+        assert!(!dir_has_any_image(&dir, None));
+        assert!(collect_image_files(&dir, true, None).is_empty());
+        assert!(collect_archive_files(&dir, true, None).is_empty());
+
+        // 放一张真实命名图片与一个真实命名归档，只应扫出合法文件
+        fs::write(dir.join("001.jpg"), b"img").unwrap();
+        fs::write(dir.join("sub").join("._002.jpg"), b"appledouble").unwrap();
+        fs::write(dir.join("sub").join("002.jpg"), b"img").unwrap();
+        fs::write(dir.join("Vol1.cbz"), b"zip").unwrap();
+
+        let imgs = collect_image_files(&dir, true, None);
+        let img_names: Vec<String> = imgs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(img_names, vec!["001.jpg", "002.jpg"]);
+
+        let archs = collect_archive_files(&dir, true, None);
+        let arch_names: Vec<String> = archs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(archs.len(), 1);
+        assert_eq!(arch_names, vec!["Vol1.cbz"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_archive_detailed_reports_unsupported_formats() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "mangapdf_unsupported_arch_{}.cbz",
+            std::process::id()
+        ));
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("001.avif", opts).unwrap();
+            writer.write_all(b"avif").unwrap();
+            writer.start_file("002.jxl", opts).unwrap();
+            writer.write_all(b"jxl").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let (entries, errors, unsupported) = load_entries_from_archive_detailed(
+            &zip_path,
+            1,
+            None::<&fn(usize, usize, &str)>,
+            None,
+        )
+        .unwrap();
+        let _ = fs::remove_file(&zip_path);
+
+        assert!(entries.is_empty());
+        assert!(errors.is_empty());
+        assert_eq!(unsupported, vec![".avif", ".jxl"]);
     }
 }

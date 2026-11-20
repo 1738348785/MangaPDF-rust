@@ -348,7 +348,8 @@ fn exif_orientation(exif_seg: &[u8]) -> Option<u8> {
         _ => return None,
     };
     let read_u16 = |offset: usize| -> Option<u16> {
-        let b = tiff.get(offset..offset + 2)?;
+        let end = offset.checked_add(2)?;
+        let b = tiff.get(offset..end)?;
         Some(if is_le {
             u16::from_le_bytes([b[0], b[1]])
         } else {
@@ -356,7 +357,8 @@ fn exif_orientation(exif_seg: &[u8]) -> Option<u8> {
         })
     };
     let read_u32 = |offset: usize| -> Option<u32> {
-        let b = tiff.get(offset..offset + 4)?;
+        let end = offset.checked_add(4)?;
+        let b = tiff.get(offset..end)?;
         Some(if is_le {
             u32::from_le_bytes([b[0], b[1], b[2], b[3]])
         } else {
@@ -376,11 +378,12 @@ fn exif_orientation(exif_seg: &[u8]) -> Option<u8> {
         };
         let tag = read_u16(entry_offset)?;
         if tag == 0x0112 {
-            let field_type = read_u16(entry_offset + 2)?;
+            let field_type = read_u16(entry_offset.checked_add(2)?)?;
+            let val_offset = entry_offset.checked_add(8)?;
             let orientation = match field_type {
-                3 => read_u16(entry_offset + 8)? as u32, // SHORT (u16)
-                4 => read_u32(entry_offset + 8)?,        // LONG (u32)
-                _ => read_u16(entry_offset + 8)? as u32,
+                3 => read_u16(val_offset)? as u32, // SHORT (u16)
+                4 => read_u32(val_offset)?,        // LONG (u32)
+                _ => read_u16(val_offset)? as u32,
             };
             return (1..=8).contains(&orientation).then_some(orientation as u8);
         }
@@ -677,8 +680,23 @@ fn flatten_to_white_16(dynamic_img: image::DynamicImage) -> (ColorSpace, Vec<u8>
             }
             (ColorSpace::DeviceGray, widen_u16_be(&luma), 16)
         }
+        image::ColorType::Rgb16 => {
+            // 无透明通道的 16-bit RGB 直接读取，避免多分配一份 4 通道 Rgba16 缓冲
+            let rgb = dynamic_img.into_rgb16().into_raw();
+            let all_gray = rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|&[r, g, b]| r == g && r == b);
+            if all_gray {
+                let gray: Vec<u16> = rgb.into_iter().step_by(3).collect();
+                (ColorSpace::DeviceGray, widen_u16_be(&gray), 16)
+            } else {
+                (ColorSpace::DeviceRgb, widen_u16_be(&rgb), 16)
+            }
+        }
         _ => {
-            // Rgb16 / Rgba16：先与纯白背景合成透明通道，再判断能否无损降为单通道
+            // Rgba16：先与纯白背景合成透明通道，再判断能否无损降为单通道
             let rgba = dynamic_img.into_rgba16();
             let mut rgb = Vec::with_capacity(width * height * 3);
             let mut all_gray = true;
@@ -913,6 +931,8 @@ pub fn decode_and_compress_flate(bytes: &[u8]) -> Result<ProcessedImage> {
         channels,
         bytes_per_sample,
     );
+    // 提前释放原始像素缓冲，避免多核并发压缩大 PNG 时同时驻留 raw_pixels 与 filtered
+    drop(raw_pixels);
     let stream_data = miniz_oxide::deflate::compress_to_vec_zlib(&filtered, 6);
 
     Ok(ProcessedImage {

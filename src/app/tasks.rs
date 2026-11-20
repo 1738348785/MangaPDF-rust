@@ -11,8 +11,275 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[derive(Debug, PartialEq, Eq)]
+enum ImportTarget {
+    Dir {
+        path: PathBuf,
+        recursive: bool,
+        name_override: Option<String>,
+        out_dir_override: Option<PathBuf>,
+    },
+    Archive(PathBuf),
+}
+
+impl ImportTarget {
+    fn sort_path(&self) -> &std::path::Path {
+        match self {
+            Self::Dir { path, .. } | Self::Archive(path) => path.as_path(),
+        }
+    }
+}
+
+struct ImportPlan {
+    targets: Vec<ImportTarget>,
+    loose_images: Vec<PathBuf>,
+    skipped_subfolders: Vec<String>,
+    unsupported_exts: BTreeSet<String>,
+}
+
+fn archive_dedup_key(path: &std::path::Path) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        path.to_string_lossy()
+            .replace('/', r"\")
+            .to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// 展开待导入的路径列表为统一的有序分卷目标（目录与归档混合按自然顺序排列），支持随时取消：
+/// - 开启「包含子文件夹图片」(scan_sub == true)：每个所选文件夹递归汇总图片，并自动发现内部 .zip/.cbz 归档；
+/// - 关闭「包含子文件夹图片」(默认)：
+///   1. 若文件夹根目录直接含有图片，仅导入根目录一级图片与直属归档，并在存在含图子目录时记录提示；
+///   2. 若根目录无直接图片，则同时检查所有非隐藏一级子目录（既涵盖含图子目录，也涵盖仅含 `.cbz`/`.zip` 的子目录），
+///      将子目录与归档按自然顺序拆分为多个独立分卷；
+///   3. 仅当目录下唯一内容为单个含图子目录（且无任何归档）时，按「单层包装目录」处理：沿用父目录名与父目录导出位置，
+///      同时递归判定仍以子目录为准，避免把 `mask/` 等缓存目录吸进分卷。
+fn plan_import_targets(
+    mut paths: Vec<PathBuf>,
+    scan_sub: bool,
+    cancel: &AtomicBool,
+) -> Option<ImportPlan> {
+    // 先按自然语义排序拖入路径，确保同时拖入多卷文件夹或 .cbz/.zip 时分卷顺序不乱
+    paths.sort_by(|a, b| source::compare_natural_paths(a, b));
+
+    let mut targets: Vec<ImportTarget> = Vec::new();
+    let mut seen_archives: HashSet<String> = HashSet::new();
+    let mut loose_images: Vec<PathBuf> = Vec::new();
+    let mut skipped_subfolders: Vec<String> = Vec::new();
+    let mut unsupported_exts: BTreeSet<String> = BTreeSet::new();
+
+    for p in paths {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        if p.is_dir() {
+            if scan_sub {
+                let mut dir_targets = vec![ImportTarget::Dir {
+                    path: p.clone(),
+                    recursive: true,
+                    name_override: None,
+                    out_dir_override: None,
+                }];
+                for arch in source::collect_archive_files(&p, true, Some(cancel)) {
+                    if seen_archives.insert(archive_dedup_key(&arch)) {
+                        dir_targets.push(ImportTarget::Archive(arch));
+                    }
+                }
+                targets.extend(dir_targets);
+            } else {
+                let direct_archives = source::collect_archive_files(&p, false, Some(cancel));
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if source::dir_has_root_images(&p) {
+                    // 根目录本身就有散图：按「单卷」导入，只附带直属归档，
+                    // 含图子目录（蒙版/翻译缓存等）记为跳过并提示，不拆成新分卷
+                    targets.push(ImportTarget::Dir {
+                        path: p.clone(),
+                        recursive: false,
+                        name_override: None,
+                        out_dir_override: None,
+                    });
+                    for arch in direct_archives {
+                        if seen_archives.insert(archive_dedup_key(&arch)) {
+                            targets.push(ImportTarget::Archive(arch));
+                        }
+                    }
+                    let skipped = source::get_direct_subfolders(&p, Some(cancel));
+                    if !skipped.is_empty() {
+                        let parent_label = derive_folder_sequence_name(&p);
+                        for sub in skipped {
+                            let sub_name = sub.file_name().unwrap_or_default().to_string_lossy();
+                            skipped_subfolders.push(format!("{}/{}", parent_label, sub_name));
+                        }
+                    }
+                } else {
+                    // 根目录没有散图：遍历全部非隐藏、非符号链接的一级子目录，
+                    // 同时兼顾「含图子目录」与「仅装 .cbz/.zip 的子目录」，避免混合目录静默漏卷。
+                    let direct_subdirs = source::get_direct_visible_subdirs(&p, Some(cancel));
+                    let mut image_subdirs: Vec<(PathBuf, bool)> = Vec::new();
+                    let mut subdir_archives: Vec<PathBuf> = Vec::new();
+
+                    for sub in direct_subdirs {
+                        if cancel.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        if source::dir_has_any_image(&sub, Some(cancel)) {
+                            // 子目录自己根一级就有图片时不再往下递归
+                            let sub_rec = !source::dir_has_root_images(&sub);
+                            if !sub_rec {
+                                let skipped = source::get_direct_subfolders(&sub, Some(cancel));
+                                if !skipped.is_empty() {
+                                    let sub_label = derive_folder_sequence_name(&sub);
+                                    for nested in skipped {
+                                        let nested_name =
+                                            nested.file_name().unwrap_or_default().to_string_lossy();
+                                        skipped_subfolders
+                                            .push(format!("{}/{}", sub_label, nested_name));
+                                    }
+                                }
+                            }
+                            image_subdirs.push((sub.clone(), sub_rec));
+                            subdir_archives
+                                .extend(source::collect_archive_files(&sub, sub_rec, Some(cancel)));
+                        } else {
+                            // 仅含归档的子目录（不含任何散图）也要扫出其内部 .zip/.cbz
+                            subdir_archives
+                                .extend(source::collect_archive_files(&sub, true, Some(cancel)));
+                        }
+                    }
+
+                    if cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
+
+                    // 只有当该目录下唯一有效内容是单个含图子目录（且没有任何归档）时，
+                    // 才视为「单层包装目录」：分卷名与输出保存目录均沿用父目录。
+                    let is_single_wrapper = image_subdirs.len() == 1
+                        && direct_archives.is_empty()
+                        && subdir_archives.is_empty();
+
+                    let mut dir_targets: Vec<ImportTarget> = Vec::new();
+                    if is_single_wrapper {
+                        let (sub, sub_rec) = image_subdirs.into_iter().next().unwrap();
+                        dir_targets.push(ImportTarget::Dir {
+                            path: sub,
+                            recursive: sub_rec,
+                            name_override: Some(derive_folder_sequence_name(&p)),
+                            out_dir_override: crate::util::parent_dir_non_empty(&p),
+                        });
+                    } else {
+                        for (sub, sub_rec) in image_subdirs {
+                            dir_targets.push(ImportTarget::Dir {
+                                path: sub,
+                                recursive: sub_rec,
+                                name_override: None,
+                                out_dir_override: None,
+                            });
+                        }
+                        for arch in direct_archives.into_iter().chain(subdir_archives) {
+                            if seen_archives.insert(archive_dedup_key(&arch)) {
+                                dir_targets.push(ImportTarget::Archive(arch));
+                            }
+                        }
+                        // 目录与归档统一按自然顺序排列，避免 `Vol01/`、`Vol02.cbz`、`Vol03/` 被拆成 `Vol01 -> Vol03 -> Vol02`
+                        dir_targets.sort_by(|a, b| {
+                            source::compare_natural_paths(a.sort_path(), b.sort_path())
+                        });
+                    }
+
+                    if dir_targets.is_empty() {
+                        for ext in source::collect_unsupported_media_exts_in_dir(
+                            &p,
+                            true,
+                            Some(cancel),
+                        ) {
+                            unsupported_exts.insert(ext);
+                        }
+                    } else {
+                        targets.extend(dir_targets);
+                    }
+                }
+            }
+        } else if source::is_archive(&p) {
+            if seen_archives.insert(archive_dedup_key(&p)) {
+                targets.push(ImportTarget::Archive(p));
+            }
+        } else if p
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(source::is_image_extension)
+        {
+            loose_images.push(p);
+        } else {
+            let ext_label = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(".{}", s.to_ascii_lowercase()))
+                .unwrap_or_else(|| "(无扩展名)".to_string());
+            unsupported_exts.insert(ext_label);
+        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    Some(ImportPlan {
+        targets,
+        loose_images,
+        skipped_subfolders,
+        unsupported_exts,
+    })
+}
+
+/// 预检输出目录是否可创建且可写入（目标文件尚未存在时通过临时探测文件验证目录权限），
+/// 防止用户手动输入非法/只读输出目录后白跑整卷几百页的转码流程。
+fn ensure_output_dir_writable(out_dir: &std::path::Path, probe_write: bool) -> Result<(), String> {
+    if out_dir.exists() && !out_dir.is_dir() {
+        return Err(format!(
+            "输出目录 \"{}\" 是一个已存在的文件，不是文件夹",
+            out_dir.display()
+        ));
+    }
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        return Err(format!("无法创建输出目录 \"{}\"：{}", out_dir.display(), e));
+    }
+    if probe_write {
+        static PROBE_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let seq = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let probe_path =
+            out_dir.join(format!(".mangapdf_probe_{}_{}.tmp", std::process::id(), seq));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(file) => {
+                drop(file);
+                let _ = std::fs::remove_file(&probe_path);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "输出目录 \"{}\" 不可写入：{}（请检查目录权限或磁盘状态）",
+                    out_dir.display(),
+                    e
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl MangaPdfApp {
-    pub(super) fn add_paths_to_current_sequence(&mut self, mut paths: Vec<PathBuf>) {
+    pub(super) fn add_paths_to_current_sequence(&mut self, paths: Vec<PathBuf>) {
         if self.is_generating || self.is_importing || paths.is_empty() {
             return;
         }
@@ -27,143 +294,26 @@ impl MangaPdfApp {
         let tx = self.task_sender.clone();
 
         spawn_guarded(tx.clone(), "导入", move || {
-            // 先按自然语义排序拖入路径，确保同时拖入多卷文件夹或 .cbz/.zip 时分卷顺序不乱
-            paths.sort_by(|a, b| source::compare_natural_paths(a, b));
-
-            // 展开待导入的目录与归档列表：
-            // - 开启「包含子文件夹图片」(scan_sub == true)：每个所选文件夹递归汇总图片，并自动发现内部 .zip/.cbz 归档；
-            // - 关闭「包含子文件夹图片」(默认)：
-            //   1. 自动发现文件夹内直属的 .zip/.cbz 漫画归档（拖入装满 .cbz 的合集目录直接按卷导入）；
-            //   2. 若文件夹根目录直接含有图片，仅导入根目录一级图片，并在存在含图子目录时记录提示；
-            //   3. 若根目录无直接图片但含多个有效子文件夹，自动拆分为多个独立分卷；
-            //   4. 若根目录无直接图片且仅有单层包装子目录，自动递归提取内部图片或归档。
-            //
-            // 每项是 `(要导入的目录, 是否递归, 分卷名覆盖)`：分卷名覆盖用于「单层包装目录」
-            // （`MyManga/Ch01/` 这种），路径取子目录以保证递归判定正确，名字仍沿用父目录。
-            let mut expanded_dirs: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
-            let mut archive_files: Vec<PathBuf> = Vec::new();
-            let mut loose_images: Vec<PathBuf> = Vec::new();
-            let mut skipped_subfolders: Vec<String> = Vec::new();
-            let mut unsupported_exts: BTreeSet<String> = BTreeSet::new();
-
-            for p in paths {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(TaskMessage::Cancelled {
-                        message: "已取消导入".to_string(),
-                        details: Vec::new(),
-                        last_output_path: None,
-                    });
-                    return;
-                }
-
-                if p.is_dir() {
-                    if scan_sub {
-                        expanded_dirs.push((p.clone(), true, None));
-                        archive_files.extend(source::collect_archive_files(
-                            &p,
-                            true,
-                            Some(&cancel),
-                        ));
-                    } else {
-                        let direct_archives =
-                            source::collect_archive_files(&p, false, Some(&cancel));
-                        if source::dir_has_root_images(&p) {
-                            // 根目录本身就有散图：按「单卷」导入，只附带直属归档，
-                            // 含图子目录（蒙版/翻译缓存等）记为跳过并提示，不拆成新分卷
-                            expanded_dirs.push((p.clone(), false, None));
-                            archive_files.extend(direct_archives);
-                            let skipped = source::get_direct_subfolders(&p, Some(&cancel));
-                            if !skipped.is_empty() {
-                                let parent_label = derive_folder_sequence_name(&p);
-                                for sub in skipped {
-                                    let sub_name =
-                                        sub.file_name().unwrap_or_default().to_string_lossy();
-                                    skipped_subfolders.push(format!("{}/{}", parent_label, sub_name));
-                                }
-                            }
-                        } else {
-                            // 根目录没有散图：每个含图子目录各自成为一个分卷。
-                            // 单子目录也走同一条路径（旧实现给它单独写死了 `push((p, true))`），
-                            // 否则「只有 1 个子目录」时递归判定会与多子目录分支不一致，
-                            // mask/ 这类只装蒙版的深层目录会被整包递归吸进分卷。
-                            let subfolders = source::get_direct_subfolders(&p, Some(&cancel));
-                            let had_direct_archives = !direct_archives.is_empty();
-                            // 「单层包装目录」（`MyManga/Ch01/`）保持旧行为：分卷仍叫 MyManga，
-                            // 只是递归判定改走子目录，避免把 mask/ 之类深层目录整包吸进来
-                            let wrapper_name = if subfolders.len() == 1 && !had_direct_archives {
-                                Some(derive_folder_sequence_name(&p))
-                            } else {
-                                None
-                            };
-                            for sub in &subfolders {
-                                // 子目录自己根一级就有图片时不再往下递归
-                                let sub_rec = !source::dir_has_root_images(sub);
-                                expanded_dirs.push((sub.clone(), sub_rec, wrapper_name.clone()));
-                                // 子目录里也可能只有 .cbz/.zip：一并扫出来，
-                                // 否则「1 个散图子目录 + 1 个只装归档的子目录」的混合目录
-                                // 会静默漏掉整卷（旧实现直接落进 len()==1 分支跳过 else 分支）
-                                archive_files.extend(source::collect_archive_files(
-                                    sub,
-                                    false,
-                                    Some(&cancel),
-                                ));
-                            }
-                            archive_files.extend(direct_archives);
-
-                            if subfolders.is_empty() && !had_direct_archives {
-                                // 既无图片也无含图子目录：尝试探测嵌套 .zip/.cbz 归档
-                                let nested_archives =
-                                    source::collect_archive_files(&p, true, Some(&cancel));
-                                if nested_archives.is_empty() {
-                                    // 记录目录内常见但不支持的漫画/图片格式，便于给出清晰引导
-                                    for ext in source::collect_unsupported_media_exts_in_dir(
-                                        &p,
-                                        true,
-                                        Some(&cancel),
-                                    ) {
-                                        unsupported_exts.insert(ext);
-                                    }
-                                } else {
-                                    archive_files.extend(nested_archives);
-                                }
-                            }
-                        }
-                    }
-                } else if source::is_archive(&p) {
-                    archive_files.push(p);
-                } else if p
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(source::is_image_extension)
-                {
-                    loose_images.push(p);
-                } else {
-                    let ext_label = p
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| format!(".{}", s.to_ascii_lowercase()))
-                        .unwrap_or_else(|| "(无扩展名)".to_string());
-                    unsupported_exts.insert(ext_label);
-                }
-            }
-
-            if cancel.load(Ordering::Relaxed) {
+            let Some(plan) = plan_import_targets(paths, scan_sub, &cancel) else {
                 let _ = tx.send(TaskMessage::Cancelled {
                     message: "已取消导入".to_string(),
                     details: Vec::new(),
                     last_output_path: None,
                 });
                 return;
-            }
+            };
 
-            archive_files.sort_by(|a, b| source::compare_natural_paths(a, b));
-            archive_files.dedup();
+            let ImportPlan {
+                targets,
+                loose_images,
+                skipped_subfolders,
+                mut unsupported_exts,
+            } = plan;
 
             let mut groups = Vec::new();
             let mut errors: Vec<String> = Vec::new();
 
-            for (p, recursive, name_override) in expanded_dirs {
+            for target in targets {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(TaskMessage::Cancelled {
                         message: "已取消导入".to_string(),
@@ -172,112 +322,118 @@ impl MangaPdfApp {
                     });
                     return;
                 }
-                // 兼容直接选择盘符根目录 (如 `D:\`) 时 `file_name()` 为空的情况，避免产生空分卷名与空输出文件名
-                let seq_name = name_override.unwrap_or_else(|| derive_folder_sequence_name(&p));
-                let progress_tx = tx.clone();
-                let label = seq_name.clone();
-                let cb = move |current: usize, total: usize, name: &str| {
-                    let _ = progress_tx.send(TaskMessage::Progress {
-                        current,
-                        total,
-                        desc: format!(
-                            "正在导入文件夹 {} [{}/{}]: {}",
-                            label, current, total, name
-                        ),
-                    });
-                };
-                match source::load_entries_from_folder_with_progress(
-                    &p,
-                    0,
-                    recursive,
-                    Some(&cb),
-                    Some(&cancel),
-                ) {
-                    Ok((entries, errs)) => {
-                        if cancel.load(Ordering::Relaxed) {
-                            let _ = tx.send(TaskMessage::Cancelled {
-                                message: "已取消导入".to_string(),
-                                details: Vec::new(),
-                                last_output_path: None,
+                match target {
+                    ImportTarget::Dir {
+                        path: p,
+                        recursive,
+                        name_override,
+                        out_dir_override,
+                    } => {
+                        // 兼容直接选择盘符根目录 (如 `D:\`) 时 `file_name()` 为空的情况，避免产生空分卷名与空输出文件名
+                        let seq_name =
+                            name_override.unwrap_or_else(|| derive_folder_sequence_name(&p));
+                        let progress_tx = tx.clone();
+                        let label = seq_name.clone();
+                        let cb = move |current: usize, total: usize, name: &str| {
+                            let _ = progress_tx.send(TaskMessage::Progress {
+                                current,
+                                total,
+                                desc: format!(
+                                    "正在导入文件夹 {} [{}/{}]: {}",
+                                    label, current, total, name
+                                ),
                             });
-                            return;
-                        }
-                        errors.extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
-                        if !entries.is_empty() {
-                            groups.push(ImportedGroup {
-                                seq_name: Some(seq_name),
-                                // 相对路径的 parent() 是空路径而不是 None，
-                                // 必须过滤掉，否则空串会覆盖默认输出目录
-                                out_dir: crate::util::parent_dir_non_empty(&p),
-                                entries,
-                            });
-                        } else {
-                            for ext in source::collect_unsupported_media_exts_in_dir(
-                                &p,
-                                recursive,
-                                Some(&cancel),
-                            ) {
-                                unsupported_exts.insert(ext);
+                        };
+                        match source::load_entries_from_folder_with_progress(
+                            &p,
+                            0,
+                            recursive,
+                            Some(&cb),
+                            Some(&cancel),
+                        ) {
+                            Ok((entries, errs)) => {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let _ = tx.send(TaskMessage::Cancelled {
+                                        message: "已取消导入".to_string(),
+                                        details: Vec::new(),
+                                        last_output_path: None,
+                                    });
+                                    return;
+                                }
+                                errors
+                                    .extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
+                                if !entries.is_empty() {
+                                    groups.push(ImportedGroup {
+                                        seq_name: Some(seq_name),
+                                        // 相对路径的 parent() 是空路径而不是 None，
+                                        // 必须过滤掉，否则空串会覆盖默认输出目录
+                                        out_dir: out_dir_override
+                                            .or_else(|| crate::util::parent_dir_non_empty(&p)),
+                                        entries,
+                                    });
+                                } else {
+                                    for ext in source::collect_unsupported_media_exts_in_dir(
+                                        &p,
+                                        recursive,
+                                        Some(&cancel),
+                                    ) {
+                                        unsupported_exts.insert(ext);
+                                    }
+                                }
                             }
+                            Err(e) => errors.push(format!("[{}] {:#}", seq_name, e)),
                         }
                     }
-                    Err(e) => errors.push(format!("[{}] {:#}", seq_name, e)),
-                }
-            }
-
-            for p in archive_files {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(TaskMessage::Cancelled {
-                        message: "已取消导入".to_string(),
-                        details: Vec::new(),
-                        last_output_path: None,
-                    });
-                    return;
-                }
-                let seq_name = p
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let progress_tx = tx.clone();
-                let label = seq_name.clone();
-                let cb = move |current: usize, total: usize, name: &str| {
-                    let _ = progress_tx.send(TaskMessage::Progress {
-                        current,
-                        total,
-                        desc: format!(
-                            "正在导入归档 {} [{}/{}]: {}",
-                            label, current, total, name
-                        ),
-                    });
-                };
-                match source::load_entries_from_archive_with_progress(
-                    &p,
-                    0,
-                    Some(&cb),
-                    Some(&cancel),
-                ) {
-                    Ok((entries, errs)) => {
-                        if cancel.load(Ordering::Relaxed) {
-                            let _ = tx.send(TaskMessage::Cancelled {
-                                message: "已取消导入".to_string(),
-                                details: Vec::new(),
-                                last_output_path: None,
+                    ImportTarget::Archive(p) => {
+                        let seq_name = p
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let progress_tx = tx.clone();
+                        let label = seq_name.clone();
+                        let cb = move |current: usize, total: usize, name: &str| {
+                            let _ = progress_tx.send(TaskMessage::Progress {
+                                current,
+                                total,
+                                desc: format!(
+                                    "正在导入归档 {} [{}/{}]: {}",
+                                    label, current, total, name
+                                ),
                             });
-                            return;
-                        }
-                        errors.extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
-                        if !entries.is_empty() {
-                            groups.push(ImportedGroup {
-                                seq_name: Some(seq_name),
-                                // 相对路径的 parent() 是空路径而不是 None，
-                                // 必须过滤掉，否则空串会覆盖默认输出目录
-                                out_dir: crate::util::parent_dir_non_empty(&p),
-                                entries,
-                            });
+                        };
+                        match source::load_entries_from_archive_detailed(
+                            &p,
+                            0,
+                            Some(&cb),
+                            Some(&cancel),
+                        ) {
+                            Ok((entries, errs, arch_unsupported)) => {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let _ = tx.send(TaskMessage::Cancelled {
+                                        message: "已取消导入".to_string(),
+                                        details: Vec::new(),
+                                        last_output_path: None,
+                                    });
+                                    return;
+                                }
+                                errors
+                                    .extend(errs.into_iter().map(|e| format!("[{}] {}", seq_name, e)));
+                                if !entries.is_empty() {
+                                    groups.push(ImportedGroup {
+                                        seq_name: Some(seq_name),
+                                        // 相对路径的 parent() 是空路径而不是 None，
+                                        // 必须过滤掉，否则空串会覆盖默认输出目录
+                                        out_dir: crate::util::parent_dir_non_empty(&p),
+                                        entries,
+                                    });
+                                } else {
+                                    unsupported_exts.extend(arch_unsupported);
+                                }
+                            }
+                            Err(e) => errors.push(format!("[{}] {:#}", seq_name, e)),
                         }
                     }
-                    Err(e) => errors.push(format!("[{}] {:#}", seq_name, e)),
                 }
             }
 
@@ -323,6 +479,17 @@ impl MangaPdfApp {
                         entries,
                     });
                 }
+            }
+
+            // 末尾统一复查取消信号：防止用户在 `collect_unsupported_media_exts_in_dir` 扫描期间点取消后
+            // 仍发送 ImportFinished 导致状态栏误报红字「未找到有效图片」
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(TaskMessage::Cancelled {
+                    message: "已取消导入".to_string(),
+                    details: Vec::new(),
+                    last_output_path: None,
+                });
+                return;
             }
 
             let _ = tx.send(TaskMessage::ImportFinished {
@@ -390,8 +557,22 @@ impl MangaPdfApp {
         };
         let final_path = out_dir.join(pdf_name);
 
+        // 提前检查输出目录合法性：若手动填成了已存在的文件路径，立即报错不白跑转码
+        if out_dir.exists() && !out_dir.is_dir() {
+            self.set_status(
+                format!(
+                    "生成失败：输出目录 \"{}\" 是一个已存在的文件，不是文件夹",
+                    out_dir.display()
+                ),
+                true,
+                Vec::new(),
+            );
+            return;
+        }
+
         // 若目标 PDF 文件已存在，弹出系统确认框防止误覆盖原文件
-        if final_path.exists() {
+        let target_exists = final_path.exists();
+        if target_exists {
             if final_path.is_dir() {
                 self.set_status(
                     format!(
@@ -429,6 +610,12 @@ impl MangaPdfApp {
                 );
                 return;
             }
+        }
+
+        // 目标尚未存在时同步预检输出目录可创建且可写入，避免整卷转码完毕写盘时才报错
+        if let Err(msg) = ensure_output_dir_writable(&out_dir, !target_exists) {
+            self.set_status(format!("生成失败：{}", msg), true, Vec::new());
+            return;
         }
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -474,7 +661,7 @@ impl MangaPdfApp {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(TaskMessage::Error(format!("生成失败: {}", e)));
+                    let _ = tx.send(TaskMessage::Error(format!("生成失败: {:#}", e)));
                 }
             }
         });
@@ -578,7 +765,7 @@ impl MangaPdfApp {
                         break;
                     }
                     Err(e) => {
-                        failed_errors.push(format!("[{}] {}", seq.name, e));
+                        failed_errors.push(format!("[{}] {:#}", seq.name, e));
                     }
                 }
             }
@@ -861,5 +1048,102 @@ impl MangaPdfApp {
                 ctx.request_repaint();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_plan_import_targets_mixed_image_and_archive_subdirs_preserves_order() {
+        let root = std::env::temp_dir().join(format!(
+            "mangapdf_plan_mixed_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Vol01")).unwrap();
+        fs::create_dir_all(root.join("Vol02")).unwrap();
+        fs::create_dir_all(root.join("Vol04")).unwrap();
+
+        fs::write(root.join("Vol01").join("001.jpg"), b"img").unwrap();
+        // Vol02 仅含归档不含散图，旧实现会将其静默漏掉
+        fs::write(root.join("Vol02").join("vol02.cbz"), b"zip").unwrap();
+        fs::write(root.join("Vol03.cbz"), b"zip").unwrap();
+        fs::write(root.join("Vol04").join("001.jpg"), b"img").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let plan = plan_import_targets(vec![root.clone()], false, &cancel).unwrap();
+
+        assert_eq!(
+            plan.targets,
+            vec![
+                ImportTarget::Dir {
+                    path: root.join("Vol01"),
+                    recursive: false,
+                    name_override: None,
+                    out_dir_override: None,
+                },
+                ImportTarget::Archive(root.join("Vol02").join("vol02.cbz")),
+                ImportTarget::Archive(root.join("Vol03.cbz")),
+                ImportTarget::Dir {
+                    path: root.join("Vol04"),
+                    recursive: false,
+                    name_override: None,
+                    out_dir_override: None,
+                },
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_plan_import_targets_single_wrapper_uses_parent_out_dir_and_reports_skipped() {
+        let parent = std::env::temp_dir().join(format!(
+            "mangapdf_plan_wrapper_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        let manga_dir = parent.join("MyManga");
+        let ch_dir = manga_dir.join("Ch01");
+        let mask_dir = ch_dir.join("mask");
+        fs::create_dir_all(&mask_dir).unwrap();
+        fs::write(ch_dir.join("001.jpg"), b"img").unwrap();
+        fs::write(mask_dir.join("001_mask.png"), b"mask").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let plan = plan_import_targets(vec![manga_dir.clone()], false, &cancel).unwrap();
+
+        assert_eq!(
+            plan.targets,
+            vec![ImportTarget::Dir {
+                path: ch_dir,
+                recursive: false,
+                name_override: Some("MyManga".to_string()),
+                out_dir_override: Some(parent.clone()),
+            }]
+        );
+        assert_eq!(plan.skipped_subfolders, vec!["Ch01/mask"]);
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn test_ensure_output_dir_writable_rejects_existing_file_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "mangapdf_out_check_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("not_a_dir.txt");
+        fs::write(&file_path, b"hi").unwrap();
+
+        assert!(ensure_output_dir_writable(&file_path, true).is_err());
+        assert!(ensure_output_dir_writable(&dir, true).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

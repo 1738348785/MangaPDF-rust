@@ -11,13 +11,19 @@ impl MangaPdfApp {
         let github_logo = self.get_github_logo(ctx);
         let github_url = "https://github.com/1738348785/MangaPDF-rust";
         let mut close_dialog = false;
+        let mut is_open = true;
 
         egui::Window::new("关于 MangaPDF")
+            .open(&mut is_open)
             .collapsible(false)
             .resizable(false)
+            .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .default_width(380.0)
             .show(ctx, |ui| {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close_dialog = true;
+                }
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 7.0);
 
                 // 顶部品牌区
@@ -128,7 +134,7 @@ impl MangaPdfApp {
                 });
             });
 
-        if close_dialog {
+        if !is_open || close_dialog {
             self.show_about_dialog = false;
         }
     }

@@ -331,13 +331,16 @@ impl MangaPdfApp {
                                 }
                             }
 
-                            // 2. 当显存纹理缓存超过上限时，淘汰远离当前视口的纹理，严控超大单行本显存峰值
-                            if self.texture_cache.len() > MAX_CACHED_TEXTURES {
-                                let keep_start = (row_range.start.saturating_sub(KEEP_BUFFER_ROWS)
-                                    * cols)
-                                    .min(item_count);
-                                let keep_end = ((row_range.end + KEEP_BUFFER_ROWS) * cols)
-                                    .min(item_count);
+                            // 2. 当显存纹理缓存超过上限时，淘汰远离当前视口的纹理，严控超大单行本显存峰值；
+                            // 宽屏/高分屏下当前保留窗口本身可能超过固定 256，阈值按保留窗口兜底避免每帧空转重建 HashSet
+                            let keep_start = (row_range.start.saturating_sub(KEEP_BUFFER_ROWS)
+                                * cols)
+                                .min(item_count);
+                            let keep_end = ((row_range.end + KEEP_BUFFER_ROWS) * cols)
+                                .min(item_count);
+                            let evict_threshold =
+                                keep_end.saturating_sub(keep_start).max(MAX_CACHED_TEXTURES);
+                            if self.texture_cache.len() > evict_threshold {
                                 let keep_ids: HashSet<usize> = self.current_sequence().items
                                     [keep_start..keep_end]
                                     .iter()
