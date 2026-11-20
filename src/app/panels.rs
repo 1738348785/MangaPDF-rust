@@ -1,4 +1,6 @@
-use super::{circular_checkbox, MangaPdfApp, PanelTheme};
+use super::{
+    circular_checkbox, display_sequence_name, truncate_with_ellipsis, MangaPdfApp, PanelTheme,
+};
 use crate::model::PageSizeMode;
 use crate::util::open_in_file_explorer;
 use eframe::egui::{self, Align, Color32, FontId, Layout, Rounding};
@@ -227,19 +229,8 @@ impl MangaPdfApp {
                                         .color(theme.primary_color),
                                 );
 
-                                let display_seq_name = if seq_name.trim().is_empty() {
-                                    "未命名分卷"
-                                } else {
-                                    seq_name.trim()
-                                };
-                                let short_name = if display_seq_name.chars().count() > 18 {
-                                    format!(
-                                        "{}...",
-                                        display_seq_name.chars().take(16).collect::<String>()
-                                    )
-                                } else {
-                                    display_seq_name.to_string()
-                                };
+                                let display_seq_name = display_sequence_name(&seq_name);
+                                let short_name = truncate_with_ellipsis(display_seq_name, 18);
                                 ui.label(
                                     egui::RichText::new(format!("分卷: {}", short_name))
                                         .font(FontId::proportional(11.0))
@@ -418,7 +409,8 @@ impl MangaPdfApp {
                                 .unwrap_or_default();
                             let dir_resp = ui.add_sized(
                                 [189.0, 22.0],
-                                egui::TextEdit::singleline(&mut dir_str),
+                                egui::TextEdit::singleline(&mut dir_str)
+                                    .hint_text("留空则默认保存至桌面"),
                             );
                             // 编辑过程中原样写回、不做 trim：否则输入首尾空格会被立刻吞掉并导致光标回跳
                             if dir_resp.changed() {

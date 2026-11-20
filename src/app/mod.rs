@@ -155,6 +155,26 @@ where
     });
 }
 
+/// 返回供界面展示的分卷名称（空串或纯空白时统一回退为 `"未命名分卷"`）
+pub(super) fn display_sequence_name(name: &str) -> &str {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        "未命名分卷"
+    } else {
+        trimmed
+    }
+}
+
+/// 按字符数上限截断展示文本，超出时保留前 `max_chars - 2` 个字符并追加 `"..."`
+pub(super) fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(2);
+        format!("{}...", text.chars().take(keep).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 /// 主题全局控件圆角是 6.0，egui 的勾选框方框只有 `icon_width`(14px) 大小，
 /// 套上 6.0 圆角会呈现"圆角小方块"，鼠标悬停时露出蓝色描边尤其明显。
 /// 这里把勾选框局部改成**正圆**：inactive 半径 = 边长的一半；
@@ -340,10 +360,19 @@ impl MangaPdfApp {
             .flat_map(|s| s.items.iter().map(|i| i.id))
             .collect();
         self.texture_cache.retain(|id, _| valid_ids.contains(id));
-        if let Some((id, _)) = &self.preview_texture {
-            if !valid_ids.contains(id) {
-                self.clear_preview_state();
-            }
+        let preview_tex_stale = self
+            .preview_texture
+            .as_ref()
+            .is_some_and(|(id, _)| !valid_ids.contains(id));
+        let preview_loading_stale = self
+            .preview_loading_id
+            .is_some_and(|id| !valid_ids.contains(&id));
+        let preview_err_stale = self
+            .preview_error
+            .as_ref()
+            .is_some_and(|(id, _)| !valid_ids.contains(id));
+        if preview_tex_stale || preview_loading_stale || preview_err_stale {
+            self.clear_preview_state();
         }
     }
 

@@ -1,4 +1,4 @@
-use super::{MangaPdfApp, PanelTheme};
+use super::{display_sequence_name, truncate_with_ellipsis, MangaPdfApp, PanelTheme};
 use crate::model::Sequence;
 use eframe::egui::{self, Align, Color32, FontId, Layout, Rounding, Stroke, Vec2};
 use std::collections::HashSet;
@@ -24,6 +24,7 @@ impl MangaPdfApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new("分卷管理:").strong());
 
+                        let mut to_switch = None;
                         let mut to_delete = None;
                         for (idx, seq) in self.sequences.iter().enumerate() {
                             let is_active = idx == self.active_sequence_idx;
@@ -40,11 +41,8 @@ impl MangaPdfApp {
                                 ui.visuals().text_color()
                             };
 
-                            let short_name = if seq.name.chars().count() > 18 {
-                                format!("{}...", seq.name.chars().take(16).collect::<String>())
-                            } else {
-                                seq.name.clone()
-                            };
+                            let display_seq_name = display_sequence_name(&seq.name);
+                            let short_name = truncate_with_ellipsis(display_seq_name, 18);
 
                             let label_text = format!("{} ({}页)", short_name, seq.items.len());
                             let btn = egui::Button::new(
@@ -54,20 +52,13 @@ impl MangaPdfApp {
                             .rounding(Rounding::same(14.0));
 
                             let hover_tip = if self.sequences.len() > 1 {
-                                format!("{} (点击切换，右键可删除)", seq.name)
+                                format!("{} (点击切换，右键可删除)", display_seq_name)
                             } else {
-                                format!("{} (点击切换)", seq.name)
+                                format!("{} (点击切换)", display_seq_name)
                             };
                             let resp = ui.add(btn).on_hover_text(hover_tip);
                             if resp.clicked() && self.active_sequence_idx != idx {
-                                self.active_sequence_idx = idx;
-                                self.preview_image_idx = None;
-                                self.preview_texture = None;
-                                self.preview_loading_id = None;
-                                *self
-                                    .preview_pending
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner()) = None;
+                                to_switch = Some(idx);
                             }
                             if self.sequences.len() > 1 {
                                 resp.context_menu(|ui| {
@@ -79,12 +70,18 @@ impl MangaPdfApp {
                             }
                         }
 
+                        if let Some(idx) = to_switch {
+                            self.active_sequence_idx = idx;
+                            self.clear_preview_state();
+                        }
+
                         if ui.button("+ 新建分卷").clicked() {
                             let name = format!("第 {:02} 卷", self.next_sequence_id);
                             let new_seq = Sequence::new(self.next_sequence_id, name);
                             self.next_sequence_id += 1;
                             self.sequences.push(new_seq);
                             self.active_sequence_idx = self.sequences.len() - 1;
+                            self.clear_preview_state();
                         }
 
                         if self.sequences.len() > 1 && ui.button("× 删除").clicked() {
@@ -92,6 +89,7 @@ impl MangaPdfApp {
                         }
 
                         if let Some(idx) = to_delete {
+                            let prev_active_idx = self.active_sequence_idx;
                             self.sequences.remove(idx);
                             // 删除位于当前分卷之前的分卷时，当前索引需前移一位，否则会悄悄切换到相邻分卷
                             if idx < self.active_sequence_idx {
@@ -99,6 +97,10 @@ impl MangaPdfApp {
                             }
                             if self.active_sequence_idx >= self.sequences.len() {
                                 self.active_sequence_idx = self.sequences.len() - 1;
+                            }
+                            if idx == prev_active_idx {
+                                // 若删除的是当前正在预览/加载中的分卷，直接关闭预览，避免同页号串跳到相邻分卷
+                                self.clear_preview_state();
                             }
                             self.cleanup_stale_textures();
                         }
@@ -219,6 +221,7 @@ impl MangaPdfApp {
                         .clicked()
                     {
                         self.current_sequence_mut().clear();
+                        self.clear_preview_state();
                         self.cleanup_stale_textures();
                     }
 
@@ -514,17 +517,10 @@ impl MangaPdfApp {
                                                             ui.add_space(4.0);
 
                                                             let display_name =
-                                                                if item.name.chars().count() > 14 {
-                                                                    format!(
-                                                                        "{}...",
-                                                                        item.name
-                                                                            .chars()
-                                                                            .take(12)
-                                                                            .collect::<String>()
-                                                                    )
-                                                                } else {
-                                                                    item.name.clone()
-                                                                };
+                                                                truncate_with_ellipsis(
+                                                                    &item.name,
+                                                                    14,
+                                                                );
 
                                                             ui.add(
                                                                 egui::Label::new(

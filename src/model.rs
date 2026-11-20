@@ -162,6 +162,19 @@ pub fn default_desktop_dir() -> Option<PathBuf> {
     std::env::current_dir().ok()
 }
 
+/// 解析最终导出目录：当 `output_dir` 为 `None` 或空白路径时，优先回退到桌面目录（兜底当前目录），
+/// 避免用户清空「输出保存目录」后把 PDF 写到拖拽启动时的 exe 目录或系统工作目录。
+pub fn resolve_output_dir(output_dir: Option<&std::path::Path>) -> PathBuf {
+    if let Some(dir) = output_dir {
+        let raw = dir.to_string_lossy();
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    default_desktop_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 impl Sequence {
     pub fn new(id: usize, name: String) -> Self {
         let output_filename = name.clone();
@@ -217,5 +230,23 @@ impl Sequence {
 
     pub fn clear(&mut self) {
         self.items.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_resolve_output_dir_falls_back_to_desktop_when_empty() {
+        let fallback = default_desktop_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(resolve_output_dir(None), fallback);
+        assert_eq!(resolve_output_dir(Some(Path::new(""))), fallback);
+        assert_eq!(resolve_output_dir(Some(Path::new("   \t  "))), fallback);
+        assert_eq!(
+            resolve_output_dir(Some(Path::new(" E:/Manga/Out "))),
+            PathBuf::from("E:/Manga/Out")
+        );
     }
 }

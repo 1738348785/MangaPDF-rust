@@ -360,7 +360,7 @@ impl MangaPdfApp {
             return;
         }
 
-        let out_dir = seq.output_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let out_dir = crate::model::resolve_output_dir(seq.output_dir.as_deref());
         let safe_name = sanitize_filename(&seq.output_filename);
         let pdf_name = if safe_name.to_ascii_lowercase().ends_with(".pdf") {
             safe_name
@@ -499,7 +499,7 @@ impl MangaPdfApp {
                     break;
                 }
 
-                let out_dir = seq.output_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+                let out_dir = crate::model::resolve_output_dir(seq.output_dir.as_deref());
                 let safe_name = sanitize_filename(&seq.output_filename);
                 let stem = if safe_name.to_ascii_lowercase().ends_with(".pdf") {
                     &safe_name[..safe_name.len() - 4]

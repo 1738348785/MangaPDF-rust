@@ -292,6 +292,26 @@ mod win_encoding {
 }
 
 #[cfg(target_os = "windows")]
+/// 判断韩文 Hangul 音节 (`U+AC00..=U+D7A3`) 是否属于现代韩语高频常见音节构成：
+/// GB2312 常用区 `0xB0..=0xC8` 与 CP949 谚文区 100% 重合，随机 GBK 字节解成韩文时
+/// 极易产生冷僻重辅音 (`ㄸ/ㅃ/ㅉ`)、带韵尾罕见元音 (`룐/얩/랸/튠/듕`) 或复合/送气韵尾 (`뺐/붚`)。
+/// 通过拆分初声/中声/终声排除这些低频假阳性组合，既防止 GBK 被 CP949 抢走，也不误伤真实韩文命名。
+fn is_common_hangul_syllable(ch: char) -> bool {
+    let idx = (ch as u32) - 0xAC00;
+    let cho = idx / 588;
+    let jung = (idx % 588) / 28;
+    let jong = idx % 28;
+    let is_rare_cho = matches!(cho, 4 | 8 | 13); // ㄸ / ㅃ / ㅉ
+    let is_rare_vowel = matches!(jung, 3 | 10 | 15) // ㅒ / ㅙ / ㅞ
+        || (jong != 0 && matches!(jung, 3 | 7 | 10 | 12 | 15 | 16 | 17 | 19));
+    let is_rare_coda = matches!(
+        jong,
+        2 | 3 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 18 | 20 | 24 | 25 | 26
+    );
+    !(is_rare_cho || is_rare_vowel || is_rare_coda)
+}
+
+#[cfg(target_os = "windows")]
 fn score_decoded_zip_entry(cp: u32, raw: &[u8], decoded: &str) -> i64 {
     let mut score = 0i64;
 
@@ -354,11 +374,16 @@ fn score_decoded_zip_entry(cp: u32, raw: &[u8], decoded: &str) -> i64 {
         }
     }
 
-    // 2. 基于解码后 Unicode 字符特征评分（假名/谚文具有极强语言指向性）
+    // 2. 基于解码后 Unicode 字符特征评分
     for ch in decoded.chars() {
         match ch {
             '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' => score += 10, // 日文平/片假名
-            '\u{AC00}'..='\u{D7A3}' => score += 10,                           // 韩文音节
+            // 常见韩文音节比 GB2312(+6) 高 1 分以保证真实韩文胜出；冷僻音节不得分，避免 GBK 被 CP949 劫持
+            '\u{AC00}'..='\u{D7A3}' if cp == 949 && is_common_hangul_syllable(ch) => score += 7,
+            '\u{AC00}'..='\u{D7A3}' => {}
+            // 现代韩文路径几乎不混用兼容区汉字与大量汉字；CP949 下解出汉字通常是 GBK `0xC9..=0xF7` 误读
+            '\u{F900}'..='\u{FAFF}' if cp == 949 => score -= 6,
+            '\u{4E00}'..='\u{9FFF}' if cp == 949 => score -= 2,
             '\u{3400}'..='\u{4DBF}' | '\u{E000}'..='\u{F8FF}' | '\u{FFFD}' => score -= 10,
             c if c.is_control() => score -= 20,
             _ => {}
@@ -379,11 +404,53 @@ pub fn primary_code_page_pool(sys_acp: u32) -> Vec<u32> {
     pool
 }
 
-/// 批量按归档级别自动探测并解码 ZIP/CBZ 原始条目名：
-/// - 合法 UTF-8（含纯 ASCII 与带 Info-ZIP Unicode 扩展字段的条目）直接保留；
-/// - 针对未置 UTF-8 标志位的非 UTF-8 归档（中文 GBK/GB18030、日文 Shift-JIS、繁体 Big5、韩文 CP949），
-///   在整包维度联合评估最佳编码，彻底避免乱码与 Shift-JIS/GBK 第二字节 `0x5C` (`\`) 导致的路径错切。
-pub fn decode_zip_entry_names(raw_names: &[&[u8]]) -> Vec<String> {
+#[cfg(target_os = "windows")]
+fn choose_zip_code_page_with_acp(non_utf8: &[&[u8]], sys_acp: u32) -> Option<u32> {
+    let pick_best = |candidates: &[u32]| -> Option<(u32, usize, i64)> {
+        let mut best: Option<(u32, usize, i64)> = None;
+        for &cp in candidates {
+            let mut valid_count = 0usize;
+            let mut total_score = if cp == sys_acp { 2i64 } else { 0i64 };
+            for &raw in non_utf8 {
+                if let Some(decoded) = win_encoding::decode_strict(cp, raw) {
+                    valid_count += 1;
+                    total_score += score_decoded_zip_entry(cp, raw, &decoded);
+                }
+            }
+            if valid_count == 0 {
+                continue;
+            }
+            let replace = match best {
+                None => true,
+                Some((_, best_valid, best_score)) => {
+                    valid_count > best_valid
+                        || (valid_count == best_valid && total_score > best_score)
+                }
+            };
+            if replace {
+                best = Some((cp, valid_count, total_score));
+            }
+        }
+        best
+    };
+
+    // 主探测池：**固定**包含简体 GBK(936) 与日文 Shift-JIS(932)，系统代码页在未重复时追加参与角逐。
+    // 不能因为本机是繁体/韩文系统就把 936 挤出候选：Big5 与 CP949 的字节区间完全覆盖 GB2312 常用区，
+    // 一旦丢掉 936，简体中文归档会被「完整解码成功」成繁体/韩文乱码，
+    // 并连带把基于名字派生的章节排序键算错，导致成品 PDF 页序错乱。
+    let primary_candidates = primary_code_page_pool(sys_acp);
+    let primary_best = pick_best(&primary_candidates);
+
+    // 仅当主探测池无法 100% 完整解码所有条目时，再扩展至 GB18030 / Big5 / CP949 / 系统默认页
+    if primary_best.is_some_and(|(_, valid, _)| valid == non_utf8.len()) {
+        primary_best.map(|(cp, _, _)| cp)
+    } else {
+        let fallback_candidates = [54936, 936, 932, 950, 949, sys_acp];
+        pick_best(&fallback_candidates).map(|(cp, _, _)| cp)
+    }
+}
+
+fn decode_zip_entry_names_with_acp(raw_names: &[&[u8]], _sys_acp: u32) -> Vec<String> {
     let mut non_utf8: Vec<&[u8]> = Vec::new();
     for &raw in raw_names {
         if std::str::from_utf8(raw).is_err() {
@@ -399,52 +466,7 @@ pub fn decode_zip_entry_names(raw_names: &[&[u8]]) -> Vec<String> {
     }
 
     #[cfg(target_os = "windows")]
-    let chosen_cp: Option<u32> = {
-        let sys_acp = win_encoding::system_acp();
-
-        let pick_best = |candidates: &[u32]| -> Option<(u32, usize, i64)> {
-            let mut best: Option<(u32, usize, i64)> = None;
-            for &cp in candidates {
-                let mut valid_count = 0usize;
-                let mut total_score = if cp == sys_acp { 2i64 } else { 0i64 };
-                for &raw in &non_utf8 {
-                    if let Some(decoded) = win_encoding::decode_strict(cp, raw) {
-                        valid_count += 1;
-                        total_score += score_decoded_zip_entry(cp, raw, &decoded);
-                    }
-                }
-                if valid_count == 0 {
-                    continue;
-                }
-                let replace = match best {
-                    None => true,
-                    Some((_, best_valid, best_score)) => {
-                        valid_count > best_valid
-                            || (valid_count == best_valid && total_score > best_score)
-                    }
-                };
-                if replace {
-                    best = Some((cp, valid_count, total_score));
-                }
-            }
-            best
-        };
-
-        // 主探测池：**固定**包含简体 GBK(936) 与日文 Shift-JIS(932)，系统代码页在未重复时追加参与角逐。
-        // 不能因为本机是繁体/韩文系统就把 936 挤出候选：Big5 与 CP949 的字节区间完全覆盖 GB2312 常用区，
-        // 一旦丢掉 936，简体中文归档会被「完整解码成功」成繁体/韩文乱码，
-        // 并连带把基于名字派生的章节排序键算错，导致成品 PDF 页序错乱。
-        let primary_candidates = primary_code_page_pool(sys_acp);
-        let primary_best = pick_best(&primary_candidates);
-
-        // 仅当主探测池无法 100% 完整解码所有条目时，再扩展至 GB18030 / Big5 / CP949 / 系统默认页
-        if primary_best.is_some_and(|(_, valid, _)| valid == non_utf8.len()) {
-            primary_best.map(|(cp, _, _)| cp)
-        } else {
-            let fallback_candidates = [54936, 936, 932, 950, 949, sys_acp];
-            pick_best(&fallback_candidates).map(|(cp, _, _)| cp)
-        }
-    };
+    let chosen_cp: Option<u32> = choose_zip_code_page_with_acp(&non_utf8, _sys_acp);
 
     raw_names
         .iter()
@@ -461,6 +483,19 @@ pub fn decode_zip_entry_names(raw_names: &[&[u8]]) -> Vec<String> {
             String::from_utf8_lossy(raw).into_owned()
         })
         .collect()
+}
+
+/// 批量按归档级别自动探测并解码 ZIP/CBZ 原始条目名：
+/// - 合法 UTF-8（含纯 ASCII 与带 Info-ZIP Unicode 扩展字段的条目）直接保留；
+/// - 针对未置 UTF-8 标志位的非 UTF-8 归档（中文 GBK/GB18030、日文 Shift-JIS、繁体 Big5、韩文 CP949），
+///   在整包维度联合评估最佳编码，彻底避免乱码与 Shift-JIS/GBK 第二字节 `0x5C` (`\`) 导致的路径错切。
+pub fn decode_zip_entry_names(raw_names: &[&[u8]]) -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    let sys_acp = win_encoding::system_acp();
+    #[cfg(not(target_os = "windows"))]
+    let sys_acp = 0u32;
+
+    decode_zip_entry_names_with_acp(raw_names, sys_acp)
 }
 
 #[cfg(test)]
@@ -596,6 +631,61 @@ mod tests {
         let _ = std::fs::set_permissions(&path, original_perms);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_gbk_archive_not_hijacked_by_cp949_on_korean_locale_or_fallback() {
+        // "第1话/封面.jpg", "第01卷/彩页/目录.jpg" (GBK 字节恰好全部落在 0xB0..=0xC8 与 949 谚文重合区的前者 + 含 0xC9..=0xF7 的后者)
+        let gbk_1: &[u8] = &[
+            0xB5, 0xDA, b'1', 0xBB, 0xB0, b'/', 0xB7, 0xE2, 0xC3, 0xE6, b'.', b'j', b'p', b'g',
+        ];
+        let gbk_2: &[u8] = &[
+            0xB5, 0xDA, b'0', b'1', 0xBE, 0xED, b'/', 0xB2, 0xCA, 0xD2, 0xB3, b'/', 0xC4, 0xBF,
+            0xC2, 0xBC, b'.', b'j', b'p', b'g',
+        ];
+
+        // 1. 模拟韩文 Windows (ACP = 949)：主候选池 [936, 932, 949] 下 GBK 归档仍须解成简体中文而非韩文乱码
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&[gbk_1], 949),
+            vec!["第1话/封面.jpg"]
+        );
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&[gbk_1, gbk_2], 949),
+            vec!["第1话/封面.jpg", "第01卷/彩页/目录.jpg"]
+        );
+
+        // 2. 模拟回退分支（含 1 个所有 CJK 代码页均无法严格解码的孤立字节条目，迫使 primary_best 触发 fallback_candidates）：
+        //    此时 54936 / 936 / 949 同场竞争，无论在 ACP=936 还是 ACP=949 下，GBK 均不能被 949 抢走
+        let broken_entry: &[u8] = b"bad_\xFF.jpg";
+        for acp in [936u32, 949, 950, 932] {
+            let decoded = decode_zip_entry_names_with_acp(&[gbk_1, broken_entry], acp);
+            assert_eq!(
+                decoded[0], "第1话/封面.jpg",
+                "ACP={acp} 回退分支下不应将 GBK 解成韩文乱码"
+            );
+        }
+
+        // 3. 真实韩文 CP949 归档在韩文系统 (ACP = 949) 及回退分支下仍应保持正确韩文解码，不被反向误伤
+        let kr_1: &[u8] = &[
+            0xC1, 0xA6, 0x31, 0xC8, 0xAD, 0x2F, 0xC7, 0xA5, 0xC1, 0xF6, 0x2E, 0x6A, 0x70, 0x67,
+        ];
+        let kr_2: &[u8] = &[
+            0xBD, 0xD6, 0xB5, 0xD5, 0xC0, 0xCC, 0x2F, 0x31, 0xC8, 0xAD, 0x2E, 0x6A, 0x70, 0x67,
+        ];
+        let kr_3: &[u8] = &[
+            0xC6, 0xAF, 0xC1, 0xFD, 0x2F, 0xBB, 0xE7, 0xB0, 0xC7, 0x2F, 0xB3, 0xA1, 0xC6, 0xC7,
+            0x2E, 0x6A, 0x70, 0x67,
+        ];
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&[kr_1, kr_2, kr_3], 949),
+            vec!["제1화/표지.jpg", "쌍둥이/1화.jpg", "특집/사건/끝판.jpg"]
+        );
+        let kr_fallback = decode_zip_entry_names_with_acp(&[kr_1, kr_2, kr_3, broken_entry], 949);
+        assert_eq!(
+            &kr_fallback[..3],
+            ["제1화/표지.jpg", "쌍둥이/1화.jpg", "특집/사건/끝판.jpg"]
+        );
     }
 
     #[test]
