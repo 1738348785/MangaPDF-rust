@@ -379,6 +379,122 @@ enum ZipNameCodec {
     CodePage(u32),
 }
 
+/// 判断 2 字节 UTF-8 字符的第二字节是否落在 `0x80..=0xA0`（GB2312 合法区间 `0xA1..=0xFE` 之外）。
+/// 这些字节在 GBK 里属于极罕见的 GBK/4 扩展区，在真实中文文件名中几乎不会出现，
+/// 却是 UTF-8 欧文大写重音（`À..Ö`/`Ü`/`à`）、俄文半数字母（`А..Р`/`р..я`）与希腊字母的高频字节。
+#[cfg(target_os = "windows")]
+fn is_utf8_2byte_outside_gb2312(ch: char) -> bool {
+    let mut buf = [0u8; 4];
+    let bytes = ch.encode_utf8(&mut buf).as_bytes();
+    bytes.len() == 2 && bytes[1] <= 0xA0
+}
+
+#[cfg(target_os = "windows")]
+fn is_cjk_code_page(cp: u32) -> bool {
+    matches!(cp, 932 | 936 | 949 | 950 | 54936)
+}
+
+/// 现代欧洲语言与日文罗马音常见拉丁字母（排除 `×`/`÷` 运算符与极罕见/易撞 GBK 的 `Ŀ`/`ŀ`/`ſ`/`ĸ` 等）
+#[cfg(target_os = "windows")]
+fn is_common_european_latin(ch: char) -> bool {
+    matches!(
+        ch,
+        // Latin-1 Supplement 字母：À..Ö, Ø..ö, ø..ÿ（法/德/西/葡/意/北欧等）
+        '\u{00C0}'..='\u{00D6}'
+            | '\u{00D8}'..='\u{00F6}'
+            | '\u{00F8}'..='\u{00FF}'
+            // Latin Extended-A 常用字母（日文罗马音长音、波兰/捷克/匈牙利/土耳其/法语 Œ/波罗的海等）
+            // 刻意排除 U+013F (`Ŀ`，恰为 GBK「目」0xC4 0xBF 的 UTF-8 误读)
+            | '\u{0100}'..='\u{0107}' // Ā ā Ă ă Ą ą Ć ć
+            | '\u{010C}'..='\u{0113}' // Č č Ď ď Đ đ Ē ē
+            | '\u{0116}'..='\u{011B}' // Ė ė Ę ę Ě ě
+            | '\u{011E}'..='\u{011F}' // Ğ ğ
+            | '\u{0122}'..='\u{0123}' // Ģ ģ
+            | '\u{012A}'..='\u{012B}' // Ī ī
+            | '\u{012E}'..='\u{0131}' // Į į İ ı
+            | '\u{0136}'..='\u{0137}' // Ķ ķ
+            | '\u{0139}'..='\u{013E}' // Ĺ ĺ Ļ ļ Ľ ľ
+            | '\u{0141}'..='\u{0148}' // Ł ł Ń ń Ņ ņ Ň ň
+            | '\u{014C}'..='\u{014D}' // Ō ō
+            | '\u{0150}'..='\u{015B}' // Ő ő Œ œ Ŕ ŕ Ŗ ŗ Ř ř Ś ś
+            | '\u{015E}'..='\u{0165}' // Ş ş Š š Ţ ţ Ť ť
+            | '\u{016A}'..='\u{016B}' // Ū ū
+            | '\u{016E}'..='\u{017E}' // Ů ů Ű ű Ų ų Ŵ ŵ Ŷ ŷ Ÿ Ź ź Ż ż Ž ž
+            // 越南语带角拉丁字母 & 罗马尼亚语下逗号字母
+            | '\u{01A0}'..='\u{01A1}' // Ơ ơ
+            | '\u{01AF}'..='\u{01B0}' // Ư ư
+            | '\u{0218}'..='\u{021B}' // Ș ș Ț ț
+    )
+}
+
+/// 现代西里尔字母（俄/乌/白俄/保加利亚/塞尔维亚/马其顿等）。
+/// 刻意排除 `U+0460..=U+04FF`（古教会斯拉夫语与少数民族扩展区），
+/// 因为 GBK 的 `页`(0xD2 0xB3 -> `ҳ`)、`选`(0xD1 0xA1 -> `ѡ`) 等高频字在 UTF-8 下全部落入该扩展区。
+#[cfg(target_os = "windows")]
+fn is_modern_cyrillic(ch: char) -> bool {
+    matches!(ch, '\u{0400}'..='\u{045F}')
+}
+
+/// 现代希腊字母（排除古希腊 `U+0370..=U+037F` 与科普特 `U+03CF..=U+03FF`，防止 GBK `图`=`ͼ` 误判）
+#[cfg(target_os = "windows")]
+fn is_modern_greek(ch: char) -> bool {
+    matches!(ch, '\u{0386}'..='\u{03CE}')
+        && !matches!(ch, '\u{0387}' | '\u{038B}' | '\u{038D}' | '\u{03A2}')
+}
+
+#[cfg(target_os = "windows")]
+fn is_modern_armenian(ch: char) -> bool {
+    matches!(ch, '\u{0531}'..='\u{0556}' | '\u{0561}'..='\u{0587}')
+}
+
+#[cfg(target_os = "windows")]
+fn is_modern_hebrew(ch: char) -> bool {
+    matches!(ch, '\u{05D0}'..='\u{05EA}')
+}
+
+#[cfg(target_os = "windows")]
+fn is_modern_arabic(ch: char) -> bool {
+    matches!(ch, '\u{0621}'..='\u{064A}' | '\u{0671}'..='\u{06D3}')
+}
+
+/// 判断区分大小写的词（西里尔/希腊/亚美尼亚）是否大小写自然：全小写、全大写或首字母大写。
+/// 这能直接识破 CP1251 误读 UTF-8 俄文产生的交替大小写（如 `Том` -> `РўРѕРј`）与 GBK 撞出的 `иС`。
+#[cfg(target_os = "windows")]
+fn is_case_coherent_bicameral_word(word: &[char]) -> bool {
+    let all_lower = word.iter().all(|c| c.is_lowercase());
+    let all_upper = word.iter().all(|c| c.is_uppercase());
+    let title_case = word.len() >= 2
+        && word[0].is_uppercase()
+        && word[1..].iter().all(|c| c.is_lowercase());
+    all_lower || all_upper || title_case
+}
+
+/// 判断带重音拉丁字母在含 ASCII 字母的拉丁词中是否符合自然大小写形态：
+/// - 放行正常词形态（`Café`、`CAFÉ`、`Pokémon`、`PokéBall`、`Épisode`、`Über`、`SuperÉpisode`）
+/// - 拒绝 CP1252 误读 UTF-8（`CafÃ©` 中的尾部孤立大写 `Ã`）与 GBK 紧贴大写缩写（`CG猫` -> `CGè`）
+#[cfg(target_os = "windows")]
+fn is_latin_char_coherent_in_word(word: &[char], idx: usize) -> bool {
+    let ch = word[idx];
+    if ch.is_uppercase() {
+        if word.iter().all(|c| c.is_uppercase()) {
+            return true;
+        }
+        let next_is_lower = word.get(idx + 1).is_some_and(|c| c.is_lowercase());
+        if idx == 0 {
+            next_is_lower
+        } else {
+            word[idx - 1].is_lowercase() && next_is_lower
+        }
+    } else {
+        let after_multi_upper =
+            idx >= 2 && word[idx - 1].is_uppercase() && word[idx - 2].is_uppercase();
+        let between_upper = idx > 0
+            && word[idx - 1].is_uppercase()
+            && word.get(idx + 1).is_some_and(|c| c.is_uppercase());
+        !(after_multi_upper || between_upper)
+    }
+}
+
 /// 单字节区间打分：利用各 CJK 代码页的高频字区分布，区分字节区间高度重叠的几种编码。
 #[cfg(target_os = "windows")]
 fn score_zip_name_bytes(cp: u32, raw: &[u8]) -> i64 {
@@ -399,15 +515,28 @@ fn score_zip_name_bytes(cp: u32, raw: &[u8]) -> i64 {
         let Some(&b2) = raw.get(i + 1) else {
             break;
         };
+        // GB18030 四字节序列（0x81..=0xFE, 0x30..=0x39, 0x81..=0xFE, 0x30..=0x39）：
+        // 按 4 字节步进，避免把后两字节误当成双字节扩展区重复扣分
+        if cp == 54936 && (0x81..=0xFE).contains(&b) && (0x30..=0x39).contains(&b2) {
+            if i + 3 < raw.len() {
+                i += 4;
+                continue;
+            }
+            break;
+        }
         match cp {
             // GB2312：一级汉字按拼音排在 0xB0..=0xD7，二级汉字排在 0xD8..=0xF7，
-            // 0xA1..=0xA9 是全角标点与假名行，0x81..=0xA0 / 0xAA..=0xAF 是 GBK 生僻扩展区
+            // 0xA1..=0xA9 是全角标点与假名行；
+            // GBK/3 (0x81..=0xA0) 与 GBK/4 (0xAA..=0xFE, 0x40..=0xA0) 均为生僻古字扩展区，
+            // 真实简体文件名极少落入，而 UTF-8 俄文/欧文/希腊文及 Big5/Shift-JIS 的低尾字节大量命中该区
             936 | 54936 => match (b, b2) {
                 (0xB0..=0xD7, 0xA1..=0xFE) => score += 6,
                 (0xD8..=0xF7, 0xA1..=0xFE) => score += 2,
                 (0xA1..=0xA9, 0xA1..=0xFE) => score += 3,
+                (0xA1..=0xA9, 0x40..=0xA0) => score -= 2,
                 (0x81..=0xA0, _) => score -= 3,
-                (0xAA..=0xAF, _) => score -= 1,
+                (0xAA..=0xFE, 0x40..=0xA0) => score -= 3,
+                (0xAA..=0xAF, 0xA1..=0xFE) => score -= 1,
                 _ => {}
             },
             // Shift-JIS：0x81..=0x9F 是 JIS X 0208 常用假名与一级汉字，0xE0..=0xEA 是二级汉字
@@ -437,14 +566,209 @@ fn score_zip_name_bytes(cp: u32, raw: &[u8]) -> i64 {
     score
 }
 
-/// 按解码后的 Unicode 文本打分：偏好真实文件名里常见的字符，重罚拉丁/西里尔/私用区等明显错解的产物。
+/// 为同书写的区分大小写词段（现代西里尔/希腊/亚美尼亚）打分。
+/// `glued_to_ascii_left` / `glued_to_ascii_right` 用于识破单字节非拉丁代码页（如 CP1251/CP1253）
+/// 将 UTF-8 欧文重音字节误解后嵌在英文单词内部的乱码（例如 `Shōnen` 在 CP1251 下变成 `ShЕЌnen`）。
+#[cfg(target_os = "windows")]
+fn score_bicameral_word(
+    codec: ZipNameCodec,
+    run: &[char],
+    glued_to_ascii_left: bool,
+    glued_to_ascii_right: bool,
+) -> i64 {
+    let len = run.len() as i64;
+    let glued_to_ascii = glued_to_ascii_left || glued_to_ascii_right;
+    let sandwiched_by_ascii = glued_to_ascii_left && glued_to_ascii_right;
+    match codec {
+        ZipNameCodec::Utf8 => {
+            if sandwiched_by_ascii {
+                return -4 * len;
+            }
+            if run.len() == 1 {
+                if glued_to_ascii {
+                    -4
+                } else if is_utf8_2byte_outside_gb2312(run[0]) {
+                    2
+                } else {
+                    -2
+                }
+            } else if is_case_coherent_bicameral_word(run) {
+                let all_upper = run.iter().all(|c| c.is_uppercase());
+                if glued_to_ascii && (run.len() < 3 || all_upper) {
+                    -4 * len
+                } else if run.len() >= 3 || !all_upper {
+                    // 2 字节 UTF-8 词按每字符 +10（+5/字节）计分，严格压过单字节代码页字节翻倍误读
+                    // （如 CP1253 把 3 字俄文 `Том` 拆成 6 字大写 `ΠΆΠΎΠΌ`，每字节至多 +3）与 GBK (+3/字节)
+                    10 * len
+                } else {
+                    // 2 字母全大写（如 GBK `小小` 撞出的 `СС`）给温和加分，避免误伤双字中文
+                    4 * len
+                }
+            } else {
+                -4 * len
+            }
+        }
+        ZipNameCodec::CodePage(cp) if !is_cjk_code_page(cp) => {
+            if glued_to_ascii {
+                return -6 * len;
+            }
+            if run.len() == 1 {
+                0
+            } else if is_case_coherent_bicameral_word(run) {
+                let all_upper = run.iter().all(|c| c.is_uppercase());
+                // CP1251 把 2 字节 UTF-8 (`0xC2..0xDF` + `0x80..0xBF`) 误读为「俄文大写 + 0x80..0xBF 区的
+                // 扩展西里尔（Ђ/Ќ/њ/ў/ѕ/ј 等，落在 U+0410..=U+044F 之外）」，如 `À` -> `ГЂ`、`Ü` -> `Гњ`。
+                // 对这类 2 字符组合不给正向词分，防止 CP1251 反向劫持 UTF-8 欧文孤立字母。
+                let is_short_cp1251_utf8_pair = run.len() == 2
+                    && run.iter().any(|c| {
+                        matches!(c, '\u{0400}'..='\u{040F}' | '\u{0450}'..='\u{045F}')
+                    });
+                if is_short_cp1251_utf8_pair {
+                    0
+                } else if run.len() == 2 && all_upper {
+                    2 * len
+                } else {
+                    // 单字节代码页每字符仅占 1 字节：+3/字节配系统先验 (+3) 足以压过 GBK (+3/字节)，
+                    // 同时绝不会因 2 字节 UTF-8 被拆成 2 个单字节字母而反超 UTF-8 (+5/字节)
+                    3 * len
+                }
+            } else {
+                -4 * len
+            }
+        }
+        ZipNameCodec::CodePage(_) => -4 * len,
+    }
+}
+
+/// 按解码后的 Unicode 文本打分：
+/// - 结合书写系统、词内上下文与大小写形态识别真实 UTF-8（含欧文、俄文、希腊、越南、泰、阿、希伯来与 CJK）
+/// - 同时精准重罚 GBK 撞 2 字节合法 UTF-8 产生的典型假象（`Ŀ¼`、`ҳ`、`ͼ`、`ѡ`、孤立重音符与私用区）
 #[cfg(target_os = "windows")]
 fn score_zip_name_text(codec: ZipNameCodec, text: &str) -> i64 {
+    let chars: Vec<char> = text.chars().collect();
     let mut score = 0i64;
-    for ch in text.chars() {
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        // 1. 拉丁词段（ASCII 字母 + 常见欧文/罗马音重音字母）
+        if ch.is_ascii_alphabetic() || is_common_european_latin(ch) {
+            let mut end = i + 1;
+            while end < chars.len()
+                && (chars[end].is_ascii_alphabetic() || is_common_european_latin(chars[end]))
+            {
+                end += 1;
+            }
+            let run = &chars[i..end];
+            let has_ascii = run.iter().any(|c| c.is_ascii_alphabetic());
+            for (k, &c) in run.iter().enumerate() {
+                if c.is_ascii() {
+                    continue;
+                }
+                score += match codec {
+                    ZipNameCodec::Utf8 => {
+                        if has_ascii && is_latin_char_coherent_in_word(run, k) {
+                            // 合法词内重音（如 Café / Pokémon / Mädchen / Shōnen / Über）：
+                            // 权重需压过 GBK (+6+3) 与 CP949 (+7+3) 单字重合分
+                            12
+                        } else if has_ascii {
+                            -4
+                        } else if is_utf8_2byte_outside_gb2312(c) {
+                            // 落在 GB2312 区间之外（第二字节 <= 0xA0，如 `À`/`à`/`Ü`/`É`），
+                            // 在 GBK/Big5/Shift-JIS 中均属生僻或非法，可安全判定为 UTF-8
+                            8
+                        } else {
+                            // 孤立单字重音且落在 GB2312 区（如 GBK「猫」-> `è`），避免误抢单字中文目录
+                            -2
+                        }
+                    }
+                    ZipNameCodec::CodePage(cp) if !is_cjk_code_page(cp) => {
+                        if has_ascii && is_latin_char_coherent_in_word(run, k) {
+                            4
+                        } else {
+                            -4
+                        }
+                    }
+                    ZipNameCodec::CodePage(_) => -6,
+                };
+            }
+            i = end;
+            continue;
+        }
+
+        // 2. 现代西里尔 / 现代希腊 / 现代亚美尼亚词段
+        if is_modern_cyrillic(ch) || is_modern_greek(ch) || is_modern_armenian(ch) {
+            let same_script: fn(char) -> bool = if is_modern_cyrillic(ch) {
+                is_modern_cyrillic
+            } else if is_modern_greek(ch) {
+                is_modern_greek
+            } else {
+                is_modern_armenian
+            };
+            let mut end = i + 1;
+            while end < chars.len() && same_script(chars[end]) {
+                end += 1;
+            }
+            let glued_left = i > 0 && chars[i - 1].is_ascii_alphabetic();
+            let glued_right = end < chars.len() && chars[end].is_ascii_alphabetic();
+            score += score_bicameral_word(codec, &chars[i..end], glued_left, glued_right);
+            i = end;
+            continue;
+        }
+
+        // 3. 希伯来 / 阿拉伯词段（无大小写）
+        if is_modern_hebrew(ch) || is_modern_arabic(ch) {
+            let same_script: fn(char) -> bool = if is_modern_hebrew(ch) {
+                is_modern_hebrew
+            } else {
+                is_modern_arabic
+            };
+            let mut end = i + 1;
+            while end < chars.len() && same_script(chars[end]) {
+                end += 1;
+            }
+            let len = (end - i) as i64;
+            let glued_left = i > 0 && chars[i - 1].is_ascii_alphabetic();
+            let glued_right = end < chars.len() && chars[end].is_ascii_alphabetic();
+            let glued = glued_left || glued_right;
+            score += match codec {
+                ZipNameCodec::Utf8 => {
+                    if glued_left && glued_right {
+                        -4 * len
+                    } else if len >= 2 {
+                        10 * len
+                    } else {
+                        -2
+                    }
+                }
+                ZipNameCodec::CodePage(cp) if !is_cjk_code_page(cp) => {
+                    if glued {
+                        -6 * len
+                    } else if len >= 2 {
+                        3 * len
+                    } else {
+                        0
+                    }
+                }
+                ZipNameCodec::CodePage(_) => -4 * len,
+            };
+            i = end;
+            continue;
+        }
+
+        // 4. 其余单字符打分
         score += match ch {
             // ASCII 可见字符与常见空白：任何编码下都合法，完全中性
             ' '..='~' | '\t' => 0,
+            // macOS NFD 分解式拉丁组合变音符（如 `e` + U+0301 = `é`，UTF-8 为 0xCC 0x80..0x8C）
+            '\u{0300}'..='\u{030C}'
+                if codec == ZipNameCodec::Utf8
+                    && i > 0
+                    && chars[i - 1].is_ascii_alphabetic() =>
+            {
+                8
+            }
             // 日文假名只可能来自 Shift-JIS 或 UTF-8 的正确解码；
             // GB2312 的 0xA4/0xA5 行也放了假名，所以其它代码页下只给一个可忽略的小分，
             // 否则 Big5 归档里 `A4 A4`(い) 这类全角假名行会把 GBK 顶上去
@@ -487,6 +811,22 @@ fn score_zip_name_text(codec: ZipNameCodec, text: &str) -> i64 {
                 ZipNameCodec::Utf8 => 10,
                 _ => 0,
             },
+            // 3 字节 UTF-8 的常见非 CJK 现代文字（越南语扩展拉丁、泰文、天城文/印度系、格鲁吉亚、藏/缅/高棉）：
+            // 遗留代码页极难偶然拼出合法 3 字节 UTF-8，在 UTF-8 候选下应给予高权重
+            '\u{1E00}'..='\u{1EFF}'
+            | '\u{0900}'..='\u{10FF}'
+            | '\u{1780}'..='\u{17FF}' => match codec {
+                ZipNameCodec::Utf8 => 10,
+                _ => -6,
+            },
+            // 3/4 字节 UTF-8 常用排版标点、符号与 Emoji（— … № ★ ♪ ♥ 箭头等）
+            '\u{2010}'..='\u{2027}'
+            | '\u{2030}'..='\u{203F}'
+            | '\u{2100}'..='\u{27BF}'
+            | '\u{1F300}'..='\u{1FAFF}' => match codec {
+                ZipNameCodec::Utf8 => 6,
+                _ => -1,
+            },
             // CP949 会在 GBK 字节上解出兼容区汉字，通常是误读
             '\u{F900}'..='\u{FAFF}' => {
                 if codec == ZipNameCodec::CodePage(949) {
@@ -497,13 +837,14 @@ fn score_zip_name_text(codec: ZipNameCodec, text: &str) -> i64 {
             }
             // CJK 扩展 A / 私用区 / 替换字符：正常文件名几乎不会出现
             '\u{3400}'..='\u{4DBF}' | '\u{E000}'..='\u{F8FF}' | '\u{FFFD}' => -10,
-            // 拉丁字母扩展、希腊、西里尔：GBK `目录` 被当成 UTF-8 解出的 `Ŀ¼`、
-            // `页` 被当成 UTF-8 解出的 `ҳ` 都落在这里，是误判最强的信号
-            '\u{00A0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}' => -6,
-            '\u{0370}'..='\u{04FF}' => -4,
+            // 剩余 2 字节区：Latin-1 符号（GBK `录` -> `¼`）、罕见 Latin Ext-A（GBK `目` -> `Ŀ`）、
+            // Latin Ext-B/IPA、古希腊（GBK `图` -> `ͼ`）、古教会斯拉夫与少数民族西里尔扩展（GBK `页` -> `ҳ`）
+            '\u{00A0}'..='\u{017F}' => -6,
+            '\u{0180}'..='\u{052F}' => -8,
             c if c.is_control() => -20,
             _ => -1,
         };
+        i += 1;
     }
     score
 }
@@ -1016,6 +1357,136 @@ mod tests {
         assert_eq!(
             strip_windows_verbatim_prefix(r"E:\Manga\vol1.pdf"),
             r"E:\Manga\vol1.pdf"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_unflagged_utf8_european_cyrillic_and_other_non_cjk_not_hijacked_by_gbk() {
+        // 1. 欧文 / 日文罗马音 / 越南语 / macOS NFD 分解形式（未置 UTF-8 标志）
+        //    注意 `é` (C3 A9) 在 GBK 中是 GB2312 一级字「茅」、在 CP949 中是常用韩文「챙」，是最容易被劫持的用例
+        let european_cases = [
+            "Café/001.jpg",
+            "Pokémon/001.jpg",
+            "CAFÉ/001.jpg",
+            "PokéBall/001.jpg",
+            "Épisode 01/Crème brûlée.jpg",
+            "Mädchen/Über/Straße 01.jpg",
+            "Español/São Paulo/Français.jpg",
+            "Shōnen Jump/001.jpg",
+            "Łódź/Český/Türkçe.jpg",
+            "Tiếng Việt/Tập 01.jpg",
+            "Cafe\u{0301}/001.jpg",
+            "À la mode/001.jpg",
+            "à la mode/001.jpg",
+            "Ü 01/001.jpg",
+        ];
+
+        // 2. 俄文 / 乌克兰文 / 希腊文 / 泰文 / 阿拉伯文 / 希伯来文 / 排版符号与 Emoji
+        //    注意 `Том` (D0 A2 D0 BE D0 BC) 全部 3 个字符都恰好落在 GB2312 一级字区，最考验词段判别
+        let other_non_cjk_cases = [
+            "Глава 1/Обложка.jpg",
+            "Том 01/001.jpg",
+            "ТОМ 01/001.jpg",
+            "Том 01/Часть 1/Страница 01.jpg",
+            "Українська/Розділ 1.jpg",
+            "Κεφάλαιο 1/001.jpg",
+            "ตอนที่ 1/001.jpg",
+            "الفصل 1/001.jpg",
+            "פרק 1/001.jpg",
+            "Vol01 — Special ★/001.jpg",
+        ];
+
+        for acp in [936u32, 932, 949, 950, 1252, 1251, 1250, 1253, 1254, 1255, 1256, 874] {
+            for &name in european_cases.iter().chain(other_non_cjk_cases.iter()) {
+                let decoded = decode_zip_entry_names_with_acp(&unflagged(&[name.as_bytes()]), acp);
+                assert_eq!(
+                    decoded,
+                    vec![name],
+                    "ACP={acp} 时未置 UTF-8 标志的 \"{name}\" 不应被遗留代码页劫持"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_gbk_valid_utf8_traps_still_decode_as_gbk() {
+        // 即使归档里只有单条恰好是合法 2 字节 UTF-8 的 GBK 文件名，也绝不能退化成乱码
+        let gbk_traps: [(&[u8], &str); 7] = [
+            // "目录/001.jpg" -> UTF-8 "Ŀ¼/001.jpg"
+            (&[0xC4, 0xBF, 0xC2, 0xBC, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'], "目录/001.jpg"),
+            // "1页.jpg" -> UTF-8 "1ҳ.jpg"
+            (&[b'1', 0xD2, 0xB3, b'.', b'j', b'p', b'g'], "1页.jpg"),
+            // "图/001.jpg" -> UTF-8 "ͼ/001.jpg"
+            (&[0xCD, 0xBC, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'], "图/001.jpg"),
+            // "猫/001.jpg" -> UTF-8 "è/001.jpg"（孤立重音，无 ASCII 词上下文）
+            (&[0xC3, 0xA8, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'], "猫/001.jpg"),
+            // "CG猫/001.jpg" -> UTF-8 "CGè/001.jpg"（大写缩写后接小写重音，大小写不自然）
+            (&[b'C', b'G', 0xC3, 0xA8, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'], "CG猫/001.jpg"),
+            // "小/001.jpg" -> UTF-8 "С/001.jpg"（单字孤立西里尔）
+            (&[0xD0, 0xA1, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'], "小/001.jpg"),
+            // "懈小/001.jpg" -> UTF-8 "иС/001.jpg"（小写接大写，大小写不自然）
+            (&[0xD0, 0xB8, 0xD0, 0xA1, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'], "懈小/001.jpg"),
+        ];
+
+        for (raw, expected) in gbk_traps {
+            assert!(
+                std::str::from_utf8(raw).is_ok(),
+                "测试用例 {expected} 必须是合法 UTF-8 字节序列以验证反劫持能力"
+            );
+            // 简体中文系统下必须解出原 GBK 中文
+            assert_eq!(
+                decode_zip_entry_names_with_acp(&unflagged(&[raw]), 936),
+                vec![expected],
+                "ACP=936 时 GBK 陷阱 \"{expected}\" 不应被 UTF-8 劫持"
+            );
+            // 无论在任何区域设置下，都绝不能被误判成 UTF-8 乱码（如 Ŀ¼ / ҳ / ͼ / è / иС）
+            let utf8_mojibake = std::str::from_utf8(raw).unwrap();
+            for acp in [936u32, 932, 949, 950, 1252, 1251] {
+                let decoded = decode_zip_entry_names_with_acp(&unflagged(&[raw]), acp);
+                assert_ne!(
+                    decoded[0], utf8_mojibake,
+                    "ACP={acp} 时 GBK 陷阱 \"{expected}\" 不应解成 UTF-8 乱码 \"{utf8_mojibake}\""
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_genuine_cp1252_cp1251_and_gb18030_4byte_archives() {
+        // 1. 真正的 CP1252 单字节西欧归档在西欧系统 (ACP=1252) 下应正确解码，不被 Big5/GBK 劫持
+        //    "Über/Mädchen.jpg" (DC 62 65 72 / 4D E4 64 63 68 65 6E) 与 "Café/Pokémon.jpg"
+        let cp1252_1: &[u8] = &[0xDC, b'b', b'e', b'r', b'/', b'M', 0xE4, b'd', b'c', b'h', b'e', b'n', b'.', b'j', b'p', b'g'];
+        let cp1252_2: &[u8] = &[b'C', b'a', b'f', 0xE9, b'/', b'P', b'o', b'k', 0xE9, b'm', b'o', b'n', b'.', b'j', b'p', b'g'];
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&unflagged(&[cp1252_1]), 1252),
+            vec!["Über/Mädchen.jpg"]
+        );
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&unflagged(&[cp1252_2]), 1252),
+            vec!["Café/Pokémon.jpg"]
+        );
+
+        // 2. 真正的 CP1251 单字节俄文归档在俄文系统 (ACP=1251) 下应正确解码
+        //    "Тома/001.jpg" (D2 EE EC E0，4 字节恰好也是合法 GBK) 与 "Глава 1/001.jpg"
+        let cp1251_toma: &[u8] = &[0xD2, 0xEE, 0xEC, 0xE0, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'];
+        let cp1251_glava: &[u8] = &[0xC3, 0xEB, 0xE0, 0xE2, 0xE0, b' ', b'1', b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'];
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&unflagged(&[cp1251_toma]), 1251),
+            vec!["Тома/001.jpg"]
+        );
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&unflagged(&[cp1251_glava]), 1251),
+            vec!["Глава 1/001.jpg"]
+        );
+
+        // 3. GB18030 四字节字符（如 `𠂇` = 95 32 90 31）应正确按 CP54936 解码
+        let gb18030_4b: &[u8] = &[0x95, 0x32, 0x90, 0x31, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'];
+        assert_eq!(
+            decode_zip_entry_names_with_acp(&unflagged(&[gb18030_4b]), 936),
+            vec!["𠂇/001.jpg"]
         );
     }
 }
