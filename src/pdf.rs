@@ -5,7 +5,7 @@ use pdf_writer::{Content, Filter as PdfFilter, Finish, Name, Pdf, Rect, Ref};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -166,15 +166,12 @@ impl ArchiveReaderCache {
             Err(err_msg) => return Err(err_msg.clone()),
         };
 
-        let mut zip_file = archive
+        let zip_file = archive
             .by_index(entry_index)
             .map_err(|e| format!("归档中找不到图片 {}: {}", decoded_path, e))?;
-        let cap = zip_file.size().min(crate::model::MAX_ZIP_PREALLOC_BYTES) as usize;
-        let mut buf = Vec::with_capacity(cap);
-        zip_file
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("读取归档内图片 {} 失败: {}", decoded_path, e))?;
-        Ok(buf)
+        let declared = zip_file.size();
+        crate::model::read_zip_entry(zip_file, declared, decoded_path)
+            .map_err(|e| format!("读取归档内图片 {} 失败: {}", decoded_path, e))
     }
 }
 
@@ -308,8 +305,11 @@ where
             }
             let processed = match res {
                 Ok(img) => img,
+                // 取消必须整卷中止，不能被当成「跳过这一页」吞掉
+                Err(e) if e.is::<CancelledError>() => return Err(e),
                 Err(e) => {
-                    // 窗口程序无控制台，eprintln 不可见：记录下来交给界面展示
+                    // 单页读不出来（文件被删、归档条目损坏、超过体积上限……）只跳过这一页，
+                    // 记录原因交给界面展示，不要让一张坏图毁掉整卷几百页的打包
                     skipped.push(format!("{}: {:#}", item.name, e));
                     continue;
                 }
@@ -684,6 +684,50 @@ mod tests {
     }
 
     #[test]
+    fn test_unreadable_page_is_skipped_instead_of_failing_whole_volume() {
+        let mut png_bytes = Vec::new();
+        let img = image::GrayImage::from_fn(8, 8, |x, _| image::Luma([x as u8 * 20]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("mangapdf_skip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.png");
+        std::fs::write(&good, &png_bytes).unwrap();
+
+        let mut seq = Sequence::new(1, "skip_test".into());
+        seq.items
+            .push(crate::img::create_image_entry(1, "good.png".into(), png_bytes, Some(good), None));
+        // 模拟「文件在导入后被删掉」：这一页读不出来，但不应连累其余页
+        seq.items.push(crate::img::create_image_entry(
+            2,
+            "gone.png".into(),
+            Vec::new(),
+            Some(dir.join("gone.png")),
+            None,
+        ));
+
+        let out_path = dir.join("out.pdf");
+        let report =
+            build_pdf_from_sequence(&seq, &out_path, None::<fn(usize, usize, &str)>).unwrap();
+
+        assert_eq!(report.pages, 1, "可读的那一页应当正常写入");
+        assert_eq!(report.skipped.len(), 1, "读不出的那一页应被记录为跳过");
+        assert!(
+            report.skipped[0].contains("gone.png"),
+            "跳过原因要带上文件名，实际：{:?}",
+            report.skipped
+        );
+        assert!(out_path.exists(), "整卷不应因为单页读不出而失败");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_pdf_writes_16bit_grayscale_png_without_bit_depth_loss() {
         let img =
             image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_fn(18, 12, |x, y| {
@@ -720,3 +764,4 @@ mod tests {
         assert!(pdf_text.contains("/Predictor 15"));
     }
 }
+

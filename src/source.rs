@@ -1,14 +1,13 @@
 use crate::img::create_image_entry;
 use crate::model::{
-    compare_natural_path_str, compute_relative_sort_keys, ArchiveEntryRef, ImageEntry,
-    MAX_ZIP_PREALLOC_BYTES,
+    compare_natural_path_str, compute_relative_sort_keys, read_zip_entry, ArchiveEntryRef,
+    ImageEntry,
 };
-use crate::util::decode_zip_entry_names;
+use crate::util::{decode_zip_entry_names, RawZipName};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -370,9 +369,14 @@ pub fn dir_has_root_images(dir: &Path) -> bool {
 }
 
 /// 快速探测目录树中是否存在至少一张有效图片（找到即短路返回，避免重复全量遍历排序）
-fn dir_has_any_image(dir: &Path) -> bool {
+fn dir_has_any_image(dir: &Path, cancel_flag: Option<&AtomicBool>) -> bool {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
+        // 「取消」在扫描阶段也必须生效：用户误拖入一个含几万个子目录的大目录时，
+        // 只有让深层遍历也响应取消，按钮才不会看起来毫无反应。
+        if is_cancelled(cancel_flag) {
+            return false;
+        }
         if let Ok(entries) = fs::read_dir(&current_dir) {
             for entry in entries.flatten() {
                 let is_symlink = entry.file_type().is_ok_and(|ft| ft.is_symlink());
@@ -399,18 +403,26 @@ fn dir_has_any_image(dir: &Path) -> bool {
 }
 
 /// 检查目录是否包含多个直接分卷子目录
-pub fn get_direct_subfolders(dir: &Path) -> Vec<PathBuf> {
+pub fn get_direct_subfolders(dir: &Path, cancel_flag: Option<&AtomicBool>) -> Vec<PathBuf> {
     let mut subfolders = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
+            if is_cancelled(cancel_flag) {
+                break;
+            }
             let path = entry.path();
             if path.is_dir() {
+                // 一级子目录同样要跳过目录联接/符号链接：否则 `D:\Manga\all -> C:\` 这类联接点
+                // 会让下面的递归探测一路爬进整个磁盘，导入表现为长时间无响应。
+                if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+                    continue;
+                }
                 let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
                 if is_system_hidden_dir(&dir_name) {
                     continue;
                 }
                 // 检查子目录内是否有有效图片
-                if dir_has_any_image(&path) {
+                if dir_has_any_image(&path, cancel_flag) {
                     subfolders.push(path);
                 }
             }
@@ -442,15 +454,27 @@ where
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("无法解析 ZIP/CBZ 归档: {}", archive_path.display()))?;
 
-    // 第一遍收集所有条目的原始字节名，整包联合探测 CJK 编码后再按路径分隔符拆解，
-    // 彻底避免 Shift-JIS / GBK 第二字节 0x5C ('\') 导致的字符错切与乱码
-    let mut raw_entry_names: Vec<Vec<u8>> = Vec::with_capacity(archive.len());
+    // 第一遍收集所有条目的原始字节名 + 「归档是否已声明它是 UTF-8」，整包联合探测 CJK 编码后再按路径
+    // 分隔符拆解，彻底避免 Shift-JIS / GBK 第二字节 0x5C ('\') 导致的字符错切与乱码。
+    //
+    // `utf8` 的判定：zip 对**没有**置 UTF-8 标志的条目会用 CP437 展开（所有非 ASCII 字节都会变长），
+    // 所以 `name() != name_raw()` 就 100% 说明该条目没有 UTF-8 标志、必须参与代码页探测；
+    // 反之（包含 Info-ZIP `0x7075` Unicode Path 扩展字段生效时 raw 已被替换成 UTF-8 的情况）
+    // 说明归档自己声明了编码，必须无条件信任，否则 GBK 里「目录」「页」这种合法 UTF-8 字节会被误判。
+    let mut raw_names: Vec<Vec<u8>> = Vec::with_capacity(archive.len());
+    let mut name_is_utf8: Vec<bool> = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let zip_file = archive.by_index_raw(i)?;
-        raw_entry_names.push(zip_file.name_raw().to_vec());
+        let raw = zip_file.name_raw();
+        name_is_utf8.push(zip_file.name().as_bytes() == raw);
+        raw_names.push(raw.to_vec());
     }
-    let raw_slices: Vec<&[u8]> = raw_entry_names.iter().map(|v| v.as_slice()).collect();
-    let decoded_names = decode_zip_entry_names(&raw_slices);
+    let entries: Vec<RawZipName<'_>> = raw_names
+        .iter()
+        .zip(name_is_utf8.iter())
+        .map(|(raw, &utf8)| RawZipName::new(raw.as_slice(), utf8))
+        .collect();
+    let decoded_names = decode_zip_entry_names(&entries);
 
     let mut valid_entries = Vec::new();
     for (i, decoded_name) in decoded_names.into_iter().enumerate() {
@@ -501,11 +525,10 @@ where
                 .next()
                 .unwrap_or(entry_name)
                 .to_string();
-            let read_res = archive.by_index(*index).and_then(|mut zip_file| {
-                let cap = zip_file.size().min(MAX_ZIP_PREALLOC_BYTES) as usize;
-                let mut bytes = Vec::with_capacity(cap);
-                zip_file.read_to_end(&mut bytes)?;
-                Ok(bytes)
+            let read_res = archive.by_index(*index).and_then(|zip_file| {
+                let declared = zip_file.size();
+                read_zip_entry(zip_file, declared, entry_name)
+                    .map_err(zip::result::ZipError::from)
             });
             let bytes = match read_res {
                 Ok(b) => b,
@@ -736,6 +759,85 @@ mod tests {
         assert_eq!(entries[1].name, "001.png");
         assert_eq!(entries[1].sort_key, "第2話/001.png");
         // 按条目索引二次读取原图字节应完全一致
+        assert_eq!(entries[0].get_bytes().unwrap(), png_bytes);
+        assert_eq!(entries[1].get_bytes().unwrap(), png_bytes);
+
+        let _ = fs::remove_file(&zip_path);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_gbk_archive_does_not_split_one_directory_into_two() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut png_bytes = Vec::new();
+        let img = image::GrayImage::from_fn(8, 8, |x, _| image::Luma([x as u8 * 25]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        // GBK 原始字节："目录/001.jpg"(12B，全部字节恰好是合法 UTF-8，会被读成 "Ŀ¼/001.jpg")
+        // 与 "目录/封面.jpg"(13B，不是合法 UTF-8)。旧实现按「能 utf8 就 utf8」逐条短路，
+        // 于是同一个「目录」被拆成 Ŀ¼ 与 目录 两个目录，排序键错乱、封面被排到最后一页。
+        let gbk_index: &[u8] = &[
+            0xC4, 0xBF, 0xC2, 0xBC, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g',
+        ];
+        let gbk_cover: &[u8] = &[
+            0xC4, 0xBF, 0xC2, 0xBC, b'/', 0xB7, 0xE2, 0xC3, 0xE6, b'.', b'j', b'p', b'g',
+        ];
+        let ph_index = b"dddd/001.jpg";
+        let ph_cover = b"dddd/yyyy.jpg";
+        assert_eq!(gbk_index.len(), ph_index.len());
+        assert_eq!(gbk_cover.len(), ph_cover.len());
+        assert_eq!(std::str::from_utf8(&gbk_index[..4]).unwrap(), "Ŀ¼");
+
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for ph in [ph_index.as_slice(), ph_cover.as_slice()] {
+                writer.start_file(std::str::from_utf8(ph).unwrap(), opts).unwrap();
+                writer.write_all(&png_bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        // 把等长 ASCII 占位符换成 GBK 原始字节，模拟未置 UTF-8 标志的国产打包工具产物
+        for (ph, raw) in [(ph_index.as_slice(), gbk_index), (ph_cover.as_slice(), gbk_cover)] {
+            let mut idx = 0;
+            while idx + ph.len() <= zip_buf.len() {
+                if &zip_buf[idx..idx + ph.len()] == ph {
+                    zip_buf[idx..idx + ph.len()].copy_from_slice(raw);
+                    idx += ph.len();
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "mangapdf_gbk_dir_test_{}.cbz",
+            std::process::id()
+        ));
+        fs::write(&zip_path, &zip_buf).unwrap();
+
+        let (entries, errors) = load_entries_from_archive_with_progress(
+            &zip_path,
+            1,
+            None::<&fn(usize, usize, &str)>,
+            None,
+        )
+        .unwrap();
+
+        assert!(errors.is_empty(), "不应有解码错误: {:?}", errors);
+        assert_eq!(entries.len(), 2);
+        // 两条名字必须落在同一个「目录」下：排序键剥掉公共祖先目录后只剩文件名
+        assert_eq!(entries[0].sort_key, "001.jpg");
+        assert_eq!(entries[1].sort_key, "封面.jpg");
+        assert_eq!(entries[1].name, "封面.jpg");
         assert_eq!(entries[0].get_bytes().unwrap(), png_bytes);
         assert_eq!(entries[1].get_bytes().unwrap(), png_bytes);
 

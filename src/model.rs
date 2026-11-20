@@ -26,6 +26,61 @@ impl PageSizeMode {
 /// ZIP 条目读取时的安全预分配容量上限 (64 MB)，防止损坏归档伪造超大头部触发进程级 OOM Abort
 pub const MAX_ZIP_PREALLOC_BYTES: u64 = 64 * 1024 * 1024;
 
+/// 单个 ZIP 条目解压后的读取硬上限 (256 MB)。
+///
+/// 预分配上限只能挡住「伪造头部」，真正的 ZIP Bomb 压缩比可以到 1000:1 以上，
+/// `read_to_end` 会一路扩容直到进程 OOM Abort。所以读取阶段必须再用 `Take` 卡一个硬上限，
+/// 超限即报错跳过该条目，而不是把整个进程拖死。
+pub const MAX_ZIP_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// 带硬上限地读取一个 ZIP 条目：先按头部声明尺寸做受限预分配，再用 `Take` 限制实际读取字节数。
+pub fn read_zip_entry<R: Read>(
+    reader: R,
+    declared_size: u64,
+    label: &str,
+) -> std::io::Result<Vec<u8>> {
+    read_zip_entry_with_limit(reader, declared_size, label, MAX_ZIP_ENTRY_BYTES)
+}
+
+/// [`read_zip_entry`] 的可测试版本：上限由调用方指定，便于用小体积数据覆盖两条拦截分支。
+fn read_zip_entry_with_limit<R: Read>(
+    reader: R,
+    declared_size: u64,
+    label: &str,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    if declared_size > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} 声明解压后 {:.1} MB，超过单条目安全上限 {:.0} MB，已跳过（疑似 ZIP Bomb 或归档损坏）",
+                label,
+                mb(declared_size),
+                mb(limit)
+            ),
+        ));
+    }
+
+    let mut buf = Vec::with_capacity(declared_size.min(MAX_ZIP_PREALLOC_BYTES) as usize);
+    reader.take(limit + 1).read_to_end(&mut buf)?;
+
+    if buf.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} 实际解压字节数超过单条目安全上限 {:.0} MB，已跳过（疑似 ZIP Bomb）",
+                label,
+                mb(limit)
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
 /// 提取一组路径剥离公共祖先目录后的相对排序键（如 `Ch01/001.jpg`；单层目录则简化为 `001.jpg`）
 pub fn compute_relative_sort_keys(raw_paths: &[String]) -> Vec<String> {
     if raw_paths.is_empty() {
@@ -116,15 +171,12 @@ impl ImageEntry {
                 .map_err(|e| format!("无法打开归档文件 {}: {}", arch.archive_path.display(), e))?;
             let mut archive = zip::ZipArchive::new(file)
                 .map_err(|e| format!("无法解析归档 {}: {}", arch.archive_path.display(), e))?;
-            let mut zip_file = archive
+            let zip_file = archive
                 .by_index(arch.entry_index)
                 .map_err(|e| format!("归档中找不到图片 {}: {}", arch.decoded_path, e))?;
-            let cap = zip_file.size().min(MAX_ZIP_PREALLOC_BYTES) as usize;
-            let mut buf = Vec::with_capacity(cap);
-            zip_file
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("读取归档内图片 {} 失败: {}", arch.decoded_path, e))?;
-            Ok(buf)
+            let declared = zip_file.size();
+            read_zip_entry(zip_file, declared, &arch.decoded_path)
+                .map_err(|e| format!("读取归档内图片 {} 失败: {}", arch.decoded_path, e))
         } else {
             Ok(self.bytes.to_vec())
         }
@@ -248,5 +300,40 @@ mod tests {
             resolve_output_dir(Some(Path::new(" E:/Manga/Out "))),
             PathBuf::from("E:/Manga/Out")
         );
+    }
+
+    #[test]
+    fn test_read_zip_entry_enforces_hard_read_limit() {
+        use std::io::Cursor;
+
+        // 1. 头部声明的解压后尺寸就超过上限：直接拒绝，不进入读取阶段
+        let err = read_zip_entry_with_limit(Cursor::new(vec![0u8; 8]), 4096, "bomb.png", 1024)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("声明解压后"),
+            "应命中「声明尺寸超限」分支，实际：{err}"
+        );
+
+        // 2. 头部声明很小、实际字节远超上限 —— 这正是预分配保护完全挡不住的 ZIP Bomb 形态，
+        //    必须由读取阶段的 Take 硬上限拦下来，而不是让 Vec 一路扩容到进程 OOM Abort
+        let err = read_zip_entry_with_limit(Cursor::new(vec![0u8; 4096]), 16, "bomb.png", 1024)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("实际解压字节数"),
+            "应命中「实际读取超限」分支，实际：{err}"
+        );
+
+        // 3. 正常范围内的条目原样读出
+        let data =
+            read_zip_entry_with_limit(Cursor::new(b"%PDF-1.7 ok".to_vec()), 11, "ok.pdf", 1024)
+                .unwrap();
+        assert_eq!(data, b"%PDF-1.7 ok");
+
+        // 4. 恰好等于上限也要放行（边界不能误伤合法大图）
+        let exact = read_zip_entry_with_limit(Cursor::new(vec![7u8; 1024]), 1024, "edge", 1024)
+            .expect("恰好等于上限的条目必须被接受");
+        assert_eq!(exact.len(), 1024);
     }
 }

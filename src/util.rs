@@ -1,9 +1,22 @@
+/// 剥离 Windows 扩展路径前缀（`\\?\` / `\\?\UNC\`）并统一成正斜杠以外的原生分隔符。
+///
+/// 注意 `\\?\UNC\server\share\a.pdf` 必须还原成 `\\server\share\a.pdf`：
+/// 如果只按 `\\?\` 裸剥，会得到 `UNC\server\share\a.pdf` 这种非法路径，explorer 直接打不开。
+pub fn strip_windows_verbatim_prefix(raw: &str) -> String {
+    let stripped = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.to_string()
+    };
+    stripped.replace('/', r"\")
+}
+
 /// 将路径转换为 Windows `explorer.exe /select,` 要求的绝对反斜杠路径（剥离 `\\?\` 前缀并替换 `/` 为 `\`）
 pub fn normalize_windows_explorer_path(path: &std::path::Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let raw = abs.to_string_lossy();
-    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    stripped.replace('/', r"\")
+    strip_windows_verbatim_prefix(&abs.to_string_lossy())
 }
 
 /// 在系统文件管理器中定位并高亮指定文件或目录
@@ -81,8 +94,29 @@ pub fn check_file_replaceable(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// 取路径的父目录，并把「空路径」视为 `None`。
+///
+/// `Path::new("vol1.cbz").parent()` 返回的是 `Some("")` 而不是 `None`，直接拿去当输出目录
+/// 会把「输出保存目录」覆盖成空串，最终导出悄悄跑到桌面；`Path::new(".").parent()` 同理。
+pub fn parent_dir_non_empty(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+}
+
 /// 从导入文件夹路径提取非空分卷名称（兼容直接选择盘符根目录如 `D:\` 时 `file_name()` 为空的情况）
 pub fn derive_folder_sequence_name(dir: &std::path::Path) -> String {
+    // 相对路径（命令行传入的 `.` / `vol1` 等）的 `file_name()` 语义没有意义：
+    // `Path::new(".")` 的 `file_name()` 是 None，会一路掉进下面的盘符分支生成 `".盘"` 这种诡异分卷名。
+    // 先转绝对路径再取名；已有根的路径（`D:\`、`/`、UNC）保持原样，避免把盘符根变成 `E盘`+数字。
+    let owned;
+    let dir = if dir.has_root() {
+        dir
+    } else {
+        owned = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        owned.as_path()
+    };
+
     if let Some(name) = dir.file_name().map(|n| n.to_string_lossy()) {
         let trimmed = name.trim();
         if !trimmed.is_empty() {
@@ -311,11 +345,37 @@ fn is_common_hangul_syllable(ch: char) -> bool {
     !(is_rare_cho || is_rare_vowel || is_rare_coda)
 }
 
-#[cfg(target_os = "windows")]
-fn score_decoded_zip_entry(cp: u32, raw: &[u8], decoded: &str) -> i64 {
-    let mut score = 0i64;
+/// 归档内单个条目名的原始字节，以及归档自身是否已经声明它是 UTF-8。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawZipName<'a> {
+    /// ZIP 中央目录里记录的名字原始字节
+    pub raw: &'a [u8],
+    /// 该条目已带 UTF-8 标志（通用位标志第 11 位），或已生效 Info-ZIP `0x7075` Unicode Path 扩展字段。
+    ///
+    /// 这类条目必须无条件按 UTF-8 解释。GBK 里 `目录`(0xC4 0xBF 0xC2 0xBC)、`页`(0xD2 0xB3)、
+    /// `图`(0xCD 0xBC) 这些高频名字的字节本身就是合法的 2 字节 UTF-8 序列，一旦按「能 utf8 就 utf8」
+    /// 短路，同一目录会被拆成 `Ŀ¼/` 与 `目录/` 两个名字，相对排序键错乱，最终成品 PDF 的页序也跟着乱。
+    pub utf8: bool,
+}
 
-    // 1. 基于各编码高频字符字节区间评分，精确区分 GBK 简体与 Shift-JIS 日文重叠区
+impl<'a> RawZipName<'a> {
+    pub const fn new(raw: &'a [u8], utf8: bool) -> Self {
+        Self { raw, utf8 }
+    }
+}
+
+/// 候选编码：UTF-8 本身也作为候选，用于纠正「没设 UTF-8 标志、但内容确实是 UTF-8」的归档。
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZipNameCodec {
+    Utf8,
+    CodePage(u32),
+}
+
+/// 单字节区间打分：利用各 CJK 代码页的高频字区分布，区分字节区间高度重叠的几种编码。
+#[cfg(target_os = "windows")]
+fn score_zip_name_bytes(cp: u32, raw: &[u8]) -> i64 {
+    let mut score = 0i64;
     let mut i = 0usize;
     while i < raw.len() {
         let b = raw[i];
@@ -323,179 +383,224 @@ fn score_decoded_zip_entry(cp: u32, raw: &[u8], decoded: &str) -> i64 {
             i += 1;
             continue;
         }
-        match cp {
-            936 | 54936 => {
-                if i + 1 < raw.len() {
-                    let b2 = raw[i + 1];
-                    if (0xB0..=0xF7).contains(&b) && (0xA1..=0xFE).contains(&b2) {
-                        score += 6; // GB2312 常用汉字区
-                    } else if (0xA1..=0xA9).contains(&b) && (0xA1..=0xFE).contains(&b2) {
-                        score += 4; // GB2312 全角标点与符号区
-                    } else if (0x81..=0xA0).contains(&b) {
-                        score -= 3; // GBK/3 生僻字区（与 Shift-JIS 高频区高度重叠）
-                    }
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            932 => {
-                if (0xA1..=0xDF).contains(&b) {
-                    score -= 3; // 半角片假名（GBK 汉字误按 Shift-JIS 解码时的典型特征）
-                    i += 1;
-                } else if i + 1 < raw.len() {
-                    if (0x81..=0x9F).contains(&b) {
-                        score += 5; // JIS X 0208 常用假名与一级汉字区
-                    } else if (0xE0..=0xEA).contains(&b) {
-                        score += 2; // JIS 二级汉字区
-                    } else {
-                        score -= 2;
-                    }
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            950 => {
-                if i + 1 < raw.len() {
-                    if (0xA4..=0xC6).contains(&b) {
-                        score += 5; // Big5 常用繁体一级字区
-                    } else if (0xA1..=0xA3).contains(&b) {
-                        score += 3;
-                    }
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => {
-                i += 2.min(raw.len() - i);
-            }
+        // Shift-JIS 的单字节半角片假名区：GBK 汉字被误按 Shift-JIS 解码时的典型特征
+        if cp == 932 && (0xA1..=0xDF).contains(&b) {
+            score -= 3;
+            i += 1;
+            continue;
         }
-    }
-
-    // 2. 基于解码后 Unicode 字符特征评分
-    for ch in decoded.chars() {
-        match ch {
-            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' => score += 10, // 日文平/片假名
-            // 常见韩文音节比 GB2312(+6) 高 1 分以保证真实韩文胜出；冷僻音节不得分，避免 GBK 被 CP949 劫持
-            '\u{AC00}'..='\u{D7A3}' if cp == 949 && is_common_hangul_syllable(ch) => score += 7,
-            '\u{AC00}'..='\u{D7A3}' => {}
-            // 现代韩文路径几乎不混用兼容区汉字与大量汉字；CP949 下解出汉字通常是 GBK `0xC9..=0xF7` 误读
-            '\u{F900}'..='\u{FAFF}' if cp == 949 => score -= 6,
-            '\u{4E00}'..='\u{9FFF}' if cp == 949 => score -= 2,
-            '\u{3400}'..='\u{4DBF}' | '\u{E000}'..='\u{F8FF}' | '\u{FFFD}' => score -= 10,
-            c if c.is_control() => score -= 20,
+        let Some(&b2) = raw.get(i + 1) else {
+            break;
+        };
+        match cp {
+            // GB2312：一级汉字按拼音排在 0xB0..=0xD7，二级汉字排在 0xD8..=0xF7，
+            // 0xA1..=0xA9 是全角标点与假名行，0x81..=0xA0 / 0xAA..=0xAF 是 GBK 生僻扩展区
+            936 | 54936 => match (b, b2) {
+                (0xB0..=0xD7, 0xA1..=0xFE) => score += 6,
+                (0xD8..=0xF7, 0xA1..=0xFE) => score += 2,
+                (0xA1..=0xA9, 0xA1..=0xFE) => score += 3,
+                (0x81..=0xA0, _) => score -= 3,
+                (0xAA..=0xAF, _) => score -= 1,
+                _ => {}
+            },
+            // Shift-JIS：0x81..=0x9F 是 JIS X 0208 常用假名与一级汉字，0xE0..=0xEA 是二级汉字
+            932 => {
+                if (0x81..=0x9F).contains(&b) {
+                    score += 5;
+                } else if (0xE0..=0xEA).contains(&b) {
+                    score += 2;
+                } else {
+                    score -= 2;
+                }
+            }
+            // Big5：一级常用字排在 0xA4..=0xC6，二级字排在 0xC9..=0xF9
+            950 => {
+                if (0xA4..=0xC6).contains(&b) {
+                    score += 5;
+                } else if (0xC9..=0xF9).contains(&b) {
+                    score += 1;
+                } else if (0x81..=0xA3).contains(&b) {
+                    score -= 2;
+                }
+            }
             _ => {}
         }
+        i += 2;
     }
-
     score
 }
 
-/// 构造 ZIP 条目名编码探测的「主候选池」：
-/// 简体 GBK(936) 与日文 Shift-JIS(932) 恒定参与（与系统区域设置无关），
-/// 系统代码页在没有重复时追加一项，让 `pick_best` 中的 `sys_acp` 同分加权继续生效。
-pub fn primary_code_page_pool(sys_acp: u32) -> Vec<u32> {
-    let mut pool = vec![936u32, 932u32];
-    if !pool.contains(&sys_acp) {
-        pool.push(sys_acp);
+/// 按解码后的 Unicode 文本打分：偏好真实文件名里常见的字符，重罚拉丁/西里尔/私用区等明显错解的产物。
+#[cfg(target_os = "windows")]
+fn score_zip_name_text(codec: ZipNameCodec, text: &str) -> i64 {
+    let mut score = 0i64;
+    for ch in text.chars() {
+        score += match ch {
+            // ASCII 可见字符与常见空白：任何编码下都合法，完全中性
+            ' '..='~' | '\t' => 0,
+            // 日文假名只可能来自 Shift-JIS 或 UTF-8 的正确解码；
+            // GB2312 的 0xA4/0xA5 行也放了假名，所以其它代码页下只给一个可忽略的小分，
+            // 否则 Big5 归档里 `A4 A4`(い) 这类全角假名行会把 GBK 顶上去
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' => {
+                match codec {
+                    ZipNameCodec::Utf8 | ZipNameCodec::CodePage(932) => 10,
+                    _ => 2,
+                }
+            }
+            // 韩文音节只可能来自 CP949 / GB18030 / UTF-8。常见音节给足分，
+            // 冷僻音节（ㄸ/ㅃ/ㅉ 与罕见韵尾组合）反而扣分，避免 GBK 被 CP949 反向劫持
+            '\u{AC00}'..='\u{D7A3}' => {
+                if !matches!(
+                    codec,
+                    ZipNameCodec::Utf8 | ZipNameCodec::CodePage(949) | ZipNameCodec::CodePage(54936)
+                ) {
+                    -4
+                } else if is_common_hangul_syllable(ch) {
+                    7
+                } else {
+                    -1
+                }
+            }
+            // 韩文兼容字母 (ㄱ..ㅣ)：韩文文件名的常见成分
+            '\u{3130}'..='\u{318F}' => 4,
+            // 全角标点与 CJK 符号：中日韩文件名的常见成分
+            '\u{3000}'..='\u{303F}' | '\u{FF01}'..='\u{FF60}' => 2,
+            // 汉字：所有中日韩代码页都能解出汉字，本身不区分对错，保持中性
+            '\u{4E00}'..='\u{9FFF}' => 0,
+            // CP949 会在 GBK 字节上解出兼容区汉字，通常是误读
+            '\u{F900}'..='\u{FAFF}' => {
+                if codec == ZipNameCodec::CodePage(949) {
+                    -6
+                } else {
+                    -2
+                }
+            }
+            // CJK 扩展 A / 私用区 / 替换字符：正常文件名几乎不会出现
+            '\u{3400}'..='\u{4DBF}' | '\u{E000}'..='\u{F8FF}' | '\u{FFFD}' => -10,
+            // 拉丁字母扩展、希腊、西里尔：GBK `目录` 被当成 UTF-8 解出的 `Ŀ¼`、
+            // `页` 被当成 UTF-8 解出的 `ҳ` 都落在这里，是误判最强的信号
+            '\u{00A0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}' => -6,
+            '\u{0370}'..='\u{04FF}' => -4,
+            c if c.is_control() => -20,
+            _ => -1,
+        };
+    }
+    score
+}
+
+/// 构造 ZIP 条目名编码探测的候选池。
+///
+/// 关键点是**与系统区域设置无关地恒定评估全部候选**（UTF-8 / GBK / Shift-JIS / Big5 / CP949 /
+/// GB18030，再加上系统代码页）。旧实现分成「主池 → 回退池」两段，只有主池（936/932/ACP）无法
+/// 100% 严格解码时才评估 950/949；但 Big5 与 CP949 的字节区间几乎完全落在 GB2312 合法范围内
+/// ——例如 Big5 的 `第1話/封面.jpg` 是 `B2 C4 31 B8 DC 2F AB CA AD B1`，GBK 能把它完整解成
+/// `材1杠/靘·`——于是 `valid == len` 恒成立，回退分支永远走不到，整包被静默误解成简体乱码。
+/// 现在所有候选在同一场评分里按总分量级决胜负，顺序仅用于同分时的确定性取舍。
+#[cfg(target_os = "windows")]
+fn zip_name_candidate_pool(sys_acp: u32) -> Vec<ZipNameCodec> {
+    let mut pool = vec![ZipNameCodec::Utf8];
+    // 936 排在 54936 之前：GBK 归档里 936 与 GB18030 的二维区间解码结果完全一致，
+    // 让行为稳定的 936 优先胜出；只有出现 4 字节序列、936 严格解码失败时才轮到 GB18030。
+    for cp in [936u32, 932, 950, 949, 54936, sys_acp] {
+        let cand = ZipNameCodec::CodePage(cp);
+        if !pool.contains(&cand) {
+            pool.push(cand);
+        }
     }
     pool
 }
 
+/// 在整包维度联合评估所有候选编码，返回总分最高的那一个。
 #[cfg(target_os = "windows")]
-fn choose_zip_code_page_with_acp(non_utf8: &[&[u8]], sys_acp: u32) -> Option<u32> {
-    let pick_best = |candidates: &[u32]| -> Option<(u32, usize, i64)> {
-        let mut best: Option<(u32, usize, i64)> = None;
-        for &cp in candidates {
-            let mut valid_count = 0usize;
-            let mut total_score = if cp == sys_acp { 2i64 } else { 0i64 };
-            for &raw in non_utf8 {
-                if let Some(decoded) = win_encoding::decode_strict(cp, raw) {
-                    valid_count += 1;
-                    total_score += score_decoded_zip_entry(cp, raw, &decoded);
-                }
-            }
-            if valid_count == 0 {
-                continue;
-            }
-            let replace = match best {
-                None => true,
-                Some((_, best_valid, best_score)) => {
-                    valid_count > best_valid
-                        || (valid_count == best_valid && total_score > best_score)
-                }
+fn choose_zip_name_codec(probe: &[&[u8]], sys_acp: u32) -> Option<ZipNameCodec> {
+    // 只要有一条严格解码失败就重罚，等价于「优先完整解码」，但不必再单独维护 valid_count 主键
+    const DECODE_FAIL_PENALTY: i64 = 1000;
+
+    let mut best: Option<(ZipNameCodec, i64)> = None;
+    for codec in zip_name_candidate_pool(sys_acp) {
+        // 系统区域设置本身就是一条弱先验：分值持平时让它胜出，但绝不能盖过真正的编码特征
+        let mut total = if codec == ZipNameCodec::CodePage(sys_acp) {
+            3i64
+        } else {
+            0i64
+        };
+        for &raw in probe {
+            let decoded = match codec {
+                ZipNameCodec::Utf8 => std::str::from_utf8(raw).ok().map(|s| s.to_string()),
+                ZipNameCodec::CodePage(cp) => win_encoding::decode_strict(cp, raw),
             };
-            if replace {
-                best = Some((cp, valid_count, total_score));
+            match decoded {
+                Some(text) => {
+                    if let ZipNameCodec::CodePage(cp) = codec {
+                        total += score_zip_name_bytes(cp, raw);
+                    }
+                    total += score_zip_name_text(codec, &text);
+                }
+                None => total -= DECODE_FAIL_PENALTY,
             }
         }
-        best
-    };
-
-    // 主探测池：**固定**包含简体 GBK(936) 与日文 Shift-JIS(932)，系统代码页在未重复时追加参与角逐。
-    // 不能因为本机是繁体/韩文系统就把 936 挤出候选：Big5 与 CP949 的字节区间完全覆盖 GB2312 常用区，
-    // 一旦丢掉 936，简体中文归档会被「完整解码成功」成繁体/韩文乱码，
-    // 并连带把基于名字派生的章节排序键算错，导致成品 PDF 页序错乱。
-    let primary_candidates = primary_code_page_pool(sys_acp);
-    let primary_best = pick_best(&primary_candidates);
-
-    // 仅当主探测池无法 100% 完整解码所有条目时，再扩展至 GB18030 / Big5 / CP949 / 系统默认页
-    if primary_best.is_some_and(|(_, valid, _)| valid == non_utf8.len()) {
-        primary_best.map(|(cp, _, _)| cp)
-    } else {
-        let fallback_candidates = [54936, 936, 932, 950, 949, sys_acp];
-        pick_best(&fallback_candidates).map(|(cp, _, _)| cp)
+        if best.is_none_or(|(_, best_score)| total > best_score) {
+            best = Some((codec, total));
+        }
     }
+    best.map(|(codec, _)| codec)
 }
 
-fn decode_zip_entry_names_with_acp(raw_names: &[&[u8]], _sys_acp: u32) -> Vec<String> {
-    let mut non_utf8: Vec<&[u8]> = Vec::new();
-    for &raw in raw_names {
-        if std::str::from_utf8(raw).is_err() {
-            non_utf8.push(raw);
-        }
-    }
-
-    if non_utf8.is_empty() {
-        return raw_names
-            .iter()
-            .map(|&raw| std::str::from_utf8(raw).unwrap_or_default().to_string())
-            .collect();
-    }
+fn decode_zip_entry_names_with_acp(entries: &[RawZipName<'_>], _sys_acp: u32) -> Vec<String> {
+    // 只有「没有 UTF-8 声明 + 含非 ASCII 字节」的条目才需要参与代码页探测：
+    // 纯 ASCII 在所有候选编码下逐字节一致；带 UTF-8 标志（或已生效 Info-ZIP 0x7075 扩展字段）
+    // 的条目由归档自己声明过编码，必须直接信任，否则 GBK 字节恰好是合法 UTF-8 时会被误判。
+    let probe: Vec<&[u8]> = entries
+        .iter()
+        .filter(|e| !e.utf8 && !e.raw.is_ascii())
+        .map(|e| e.raw)
+        .collect();
 
     #[cfg(target_os = "windows")]
-    let chosen_cp: Option<u32> = choose_zip_code_page_with_acp(&non_utf8, _sys_acp);
+    let chosen: Option<ZipNameCodec> = if probe.is_empty() {
+        None
+    } else {
+        choose_zip_name_codec(&probe, _sys_acp)
+    };
 
-    raw_names
+    entries
         .iter()
-        .map(|&raw| {
-            if let Ok(s) = std::str::from_utf8(raw) {
-                return s.to_string();
+        .map(|entry| {
+            if entry.utf8 || entry.raw.is_ascii() {
+                // ASCII 在 UTF-8 与全部候选代码页下逐字节一致，直接按 UTF-8 处理即可
+                return String::from_utf8_lossy(entry.raw).into_owned();
             }
             #[cfg(target_os = "windows")]
-            if let Some(cp) = chosen_cp {
-                if let Some(decoded) = win_encoding::decode_strict(cp, raw) {
-                    return decoded;
+            if let Some(codec) = chosen {
+                match codec {
+                    ZipNameCodec::Utf8 => {
+                        if let Ok(s) = std::str::from_utf8(entry.raw) {
+                            return s.to_string();
+                        }
+                    }
+                    ZipNameCodec::CodePage(cp) => {
+                        if let Some(decoded) = win_encoding::decode_strict(cp, entry.raw) {
+                            return decoded;
+                        }
+                    }
                 }
             }
-            String::from_utf8_lossy(raw).into_owned()
+            String::from_utf8_lossy(entry.raw).into_owned()
         })
         .collect()
 }
 
 /// 批量按归档级别自动探测并解码 ZIP/CBZ 原始条目名：
-/// - 合法 UTF-8（含纯 ASCII 与带 Info-ZIP Unicode 扩展字段的条目）直接保留；
-/// - 针对未置 UTF-8 标志位的非 UTF-8 归档（中文 GBK/GB18030、日文 Shift-JIS、繁体 Big5、韩文 CP949），
-///   在整包维度联合评估最佳编码，彻底避免乱码与 Shift-JIS/GBK 第二字节 `0x5C` (`\`) 导致的路径错切。
-pub fn decode_zip_entry_names(raw_names: &[&[u8]]) -> Vec<String> {
+/// - 已置 UTF-8 标志（含 Info-ZIP Unicode 扩展字段）与纯 ASCII 的条目直接按 UTF-8 保留；
+/// - 其余条目（中文 GBK/GB18030、日文 Shift-JIS、繁体 Big5、韩文 CP949）在整包维度联合评估最佳编码，
+///   彻底避免乱码与 Shift-JIS/GBK 第二字节 `0x5C` (`\`) 导致的路径错切。
+pub fn decode_zip_entry_names(entries: &[RawZipName<'_>]) -> Vec<String> {
     #[cfg(target_os = "windows")]
     let sys_acp = win_encoding::system_acp();
     #[cfg(not(target_os = "windows"))]
     let sys_acp = 0u32;
 
-    decode_zip_entry_names_with_acp(raw_names, sys_acp)
+    decode_zip_entry_names_with_acp(entries, sys_acp)
 }
 
 #[cfg(test)]
@@ -523,6 +628,12 @@ mod tests {
         assert!(sanitized.chars().count() <= 160);
     }
 
+    /// 构造「没有 UTF-8 标志」的条目列表（绝大多数国产/日产打包工具的默认行为）
+    #[cfg(target_os = "windows")]
+    fn unflagged<'a>(raw: &[&'a [u8]]) -> Vec<RawZipName<'a>> {
+        raw.iter().map(|&r| RawZipName::new(r, false)).collect()
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn test_decode_zip_entry_names_gbk_and_shift_jis_with_0x5c() {
@@ -531,7 +642,7 @@ mod tests {
             0xB5, 0xDA, b'1', 0xBB, 0xB0, b'/', 0xB7, 0xE2, 0xC3, 0xE6, b'.', b'j', b'p', b'g',
         ];
         let gbk_2: &[u8] = &[0xB5, 0xDA, b'1', 0xBB, 0xB0, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g'];
-        let gbk_decoded = decode_zip_entry_names(&[gbk_1, gbk_2]);
+        let gbk_decoded = decode_zip_entry_names(&unflagged(&[gbk_1, gbk_2]));
         assert_eq!(gbk_decoded, vec!["第1话/封面.jpg", "第1话/001.jpg"]);
 
         // 2. Shift-JIS 编码日文归档（特意包含第二字节为 0x5C '\' 的「表」[0x95, 0x5C] 与「ソ」[0x83, 0x5C]）
@@ -542,7 +653,7 @@ mod tests {
         let sjis_2: &[u8] = &[
             0x91, 0xE6, b'1', 0x98, 0x62, b'/', 0x83, 0x5C, 0x83, 0x89, b'.', b'j', b'p', b'g',
         ];
-        let sjis_decoded = decode_zip_entry_names(&[sjis_1, sjis_2]);
+        let sjis_decoded = decode_zip_entry_names(&unflagged(&[sjis_1, sjis_2]));
         assert_eq!(sjis_decoded, vec!["第1話/表紙.jpg", "第1話/ソラ.jpg"]);
         assert!(
             !sjis_decoded[0].contains('\\'),
@@ -551,39 +662,176 @@ mod tests {
 
         // 3. 标准 UTF-8 归档保持不变
         let utf8_name = "第01話/表紙.png".as_bytes();
-        assert_eq!(decode_zip_entry_names(&[utf8_name]), vec!["第01話/表紙.png"]);
+        assert_eq!(
+            decode_zip_entry_names(&unflagged(&[utf8_name])),
+            vec!["第01話/表紙.png"]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_utf8_flag_prevents_gbk_bytes_being_misread_as_utf8() {
+        // GBK 的「目录」= C4 BF C2 BC，本身就是合法的 2 字节 UTF-8（会被读成 "Ŀ¼"）；
+        // 「1页」= 31 D2 B3，同样合法（会被读成 "1ҳ"）。
+        // 旧实现用 `std::str::from_utf8(raw).is_ok()` 做短路，于是同一个目录被拆成
+        // `Ŀ¼/001.jpg` 与 `目录/封面.jpg` 两个互相独立的目录，相对排序键错乱、成品 PDF 页序跟着乱。
+        let mixed_dir_flat: &[u8] = b"\\\xC4\xBF\xC2\xBC/001.jpg";
+        let mixed_dir_gbk: &[u8] = &[
+            0xC4, 0xBF, 0xC2, 0xBC, b'/', 0xB7, 0xE2, 0xC3, 0xE6, b'.', b'j', b'p', b'g',
+        ];
+        // 先确认第一条测试数据确实踩中了「GBK 字节恰好是合法 UTF-8」的陷阱：
+        // 整条名字（含「目录」）都是合法 UTF-8，会被旧实现整条读成 "Ŀ¼/001.jpg"
+        assert_eq!(
+            std::str::from_utf8(&mixed_dir_flat[1..]).unwrap(),
+            "Ŀ¼/001.jpg"
+        );
+
+        // 没有 UTF-8 标志（两个条目都没有）→ 整包按 GBK 统一解码，目录不再被撕裂
+        let decoded = decode_zip_entry_names(&unflagged(&[mixed_dir_flat, mixed_dir_gbk]));
+        assert_eq!(decoded, vec!["\\目录/001.jpg", "目录/封面.jpg"]);
+
+        // 一旦归档显式声明了 UTF-8 标志，就必须无条件信任它，不能再按本地代码页重新探测
+        let flagged = vec![
+            RawZipName::new(b"/\xC4\xBF\xC2\xBC/001.jpg", true),
+            RawZipName::new("目录/封面.jpg".as_bytes(), true),
+        ];
+        assert_eq!(
+            decode_zip_entry_names(&flagged),
+            vec!["/Ŀ¼/001.jpg", "目录/封面.jpg"]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_utf8_archive_without_flag_still_decodes_as_utf8() {
+        // 部分工具写出的归档内容是 UTF-8，却没有置 UTF-8 标志位。
+        // 候选池里 UTF-8 必须自己参与竞争，否则整包会被按 GBK 解成乱码。
+        let names: [&[u8]; 3] = [
+            "第01話/表紙.png".as_bytes(),
+            "第01話/001.png".as_bytes(),
+            "第02話/目次.png".as_bytes(),
+        ];
+        assert_eq!(
+            decode_zip_entry_names(&unflagged(&names)),
+            vec!["第01話/表紙.png", "第01話/001.png", "第02話/目次.png"]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_big5_archive_detected_on_simplified_chinese_locale() {
+        // 繁体 Big5 路径：字节区间几乎完全落在 GB2312 合法区内，
+        // GBK 能把整包「完整解码成功」成乱码，所以旧的「主池 100% 解码就短路」逻辑永远救不回来。
+        let big5_1: &[u8] = &[
+            0xB2, 0xC4, b'1', 0xB8, 0xDC, b'/', 0xAB, 0xCA, 0xAD, 0xB1, b'.', b'j', b'p', b'g',
+        ];
+        let big5_2: &[u8] = &[
+            0xBA, 0xA9, 0xB5, 0x65, 0xB2, 0xC4, b'0', b'1', 0xA8, 0xF7, b'/', 0xA5, 0xD8, 0xBF,
+            0xFD, b'.', b'j', b'p', b'g',
+        ];
+        let big5_3: &[u8] = &[
+            0xC1, 0x63, 0xC5, 0xE9, 0xA4, 0xA4, 0xA4, 0xE5, b'/', 0xB4, 0xFA, 0xB8, 0xD5, b'.',
+            b'j', b'p', b'g',
+        ];
+
+        for acp in [936u32, 932, 950, 949, 1252] {
+            let decoded = decode_zip_entry_names_with_acp(&unflagged(&[big5_1]), acp);
+            assert_eq!(decoded, vec!["第1話/封面.jpg"], "ACP={acp}");
+        }
+        let decoded = decode_zip_entry_names_with_acp(&unflagged(&[big5_2, big5_3]), 936);
+        assert_eq!(decoded, vec!["漫畫第01卷/目錄.jpg", "繁體中文/測試.jpg"]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_cp949_archive_detected_on_simplified_chinese_locale() {
+        // 韩文 CP949 路径同样能被 GBK 完整解码（"力1拳/钎瘤.jpg"），
+        // 旧实现里 949 只在「主池失败」的回退分支才参战，于是简体中文系统上永远识别不出来。
+        let kr_1: &[u8] = &[
+            0xC1, 0xA6, 0x31, 0xC8, 0xAD, 0x2F, 0xC7, 0xA5, 0xC1, 0xF6, 0x2E, 0x6A, 0x70, 0x67,
+        ];
+        let kr_2: &[u8] = &[
+            0xBD, 0xD6, 0xB5, 0xD5, 0xC0, 0xCC, 0x2F, 0x31, 0xC8, 0xAD, 0x2E, 0x6A, 0x70, 0x67,
+        ];
+        for acp in [936u32, 932, 949, 950, 1252] {
+            let decoded = decode_zip_entry_names_with_acp(&unflagged(&[kr_1, kr_2]), acp);
+            assert_eq!(
+                decoded,
+                vec!["제1화/표지.jpg", "쌍둥이/1화.jpg"],
+                "ACP={acp} 时韩文 CP949 归档不应被 GBK 抢走"
+            );
+        }
     }
 
     #[test]
-    fn test_derive_folder_sequence_name_handles_drive_roots() {
+    fn test_derive_folder_sequence_name_handles_drive_roots_and_relative_paths() {
         use std::path::Path;
         assert_eq!(derive_folder_sequence_name(Path::new(r"E:\Manga\第01卷")), "第01卷");
         assert_eq!(derive_folder_sequence_name(Path::new(r"D:\")), "D盘");
         assert_eq!(derive_folder_sequence_name(Path::new("/")), "根目录");
+
+        // 相对路径（命令行 `MangaPDF.exe .`）：旧实现会落进盘符分支生成 ".盘"
+        let cwd_name = std::env::current_dir()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .filter(|n| !n.trim().is_empty());
+        if let Some(expected) = cwd_name {
+            assert_eq!(derive_folder_sequence_name(Path::new(".")), expected);
+        }
+        assert_ne!(derive_folder_sequence_name(Path::new(".")), ".盘");
     }
 
     #[test]
-    fn test_primary_code_page_pool_always_includes_gbk() {
-        // 简体系统：池与此前完全一致，行为不变
-        assert_eq!(primary_code_page_pool(936), vec![936, 932]);
-        // 日文系统：932 已在池内，不重复追加
-        assert_eq!(primary_code_page_pool(932), vec![936, 932]);
-        // 繁体 / 韩文 / 西欧系统：936 必须仍然参战，
-        // 否则 GBK 归档会被 Big5/CP949 "完整解码成功"成乱码，连带算错章节排序
-        for acp in [950u32, 949, 1252, 437] {
-            let pool = primary_code_page_pool(acp);
-            assert!(pool.contains(&936), "ACP={acp} 时主探测池必须包含 GBK(936)");
+    fn test_parent_dir_non_empty_ignores_empty_relative_parent() {
+        use std::path::{Path, PathBuf};
+        // `Path::new("vol1.cbz").parent()` 是 Some("")，绝不能拿去当输出目录
+        assert_eq!(Path::new("vol1.cbz").parent(), Some(Path::new("")));
+        assert_eq!(parent_dir_non_empty(Path::new("vol1.cbz")), None);
+        assert_eq!(
+            parent_dir_non_empty(Path::new(r"E:\Manga\vol1.cbz")),
+            Some(PathBuf::from(r"E:\Manga"))
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_zip_name_candidate_pool_always_covers_every_supported_code_page() {
+        // 任何系统区域设置下，GBK / Shift-JIS / Big5 / CP949 / GB18030 / UTF-8 都必须参与同一场角逐，
+        // 否则「Big5 或 CP949 字节恰好能被 GBK 完整解码」的归档会永远走不到扩展分支。
+        for acp in [936u32, 932, 949, 950, 1252, 437] {
+            let pool = zip_name_candidate_pool(acp);
+            assert!(pool.contains(&ZipNameCodec::Utf8), "ACP={acp} 时 UTF-8 必须参战");
+            for cp in [936u32, 932, 950, 949, 54936] {
+                assert!(
+                    pool.contains(&ZipNameCodec::CodePage(cp)),
+                    "ACP={acp} 时 CP{cp} 必须参战"
+                );
+            }
             assert!(
-                pool.contains(&932),
-                "ACP={acp} 时主探测池必须包含 Shift-JIS(932)"
+                pool.contains(&ZipNameCodec::CodePage(acp)),
+                "ACP={acp} 自身也要参与角逐"
             );
-            assert!(pool.contains(&acp), "ACP={acp} 自身也要参与角逐");
+            let mut deduped = pool.clone();
+            deduped.sort_by_key(|c| format!("{:?}", c));
+            deduped.dedup();
             assert_eq!(
-                pool.iter().filter(|&&cp| cp == acp).count(),
-                1,
-                "ACP={acp} 不应重复出现"
+                deduped.len(),
+                pool.len(),
+                "ACP={acp} 时候选池不应有重复项"
             );
         }
+        // 简体系统下池的顺序：UTF-8 → 936 → 932 → 950 → 949 → 54936（仅用于同分取舍）
+        assert_eq!(
+            zip_name_candidate_pool(936),
+            vec![
+                ZipNameCodec::Utf8,
+                ZipNameCodec::CodePage(936),
+                ZipNameCodec::CodePage(932),
+                ZipNameCodec::CodePage(950),
+                ZipNameCodec::CodePage(949),
+                ZipNameCodec::CodePage(54936),
+            ]
+        );
     }
 
     #[test]
@@ -645,28 +893,32 @@ mod tests {
             0xC2, 0xBC, b'.', b'j', b'p', b'g',
         ];
 
-        // 1. 模拟韩文 Windows (ACP = 949)：主候选池 [936, 932, 949] 下 GBK 归档仍须解成简体中文而非韩文乱码
-        assert_eq!(
-            decode_zip_entry_names_with_acp(&[gbk_1], 949),
-            vec!["第1话/封面.jpg"]
-        );
-        assert_eq!(
-            decode_zip_entry_names_with_acp(&[gbk_1, gbk_2], 949),
-            vec!["第1话/封面.jpg", "第01卷/彩页/目录.jpg"]
-        );
-
-        // 2. 模拟回退分支（含 1 个所有 CJK 代码页均无法严格解码的孤立字节条目，迫使 primary_best 触发 fallback_candidates）：
-        //    此时 54936 / 936 / 949 同场竞争，无论在 ACP=936 还是 ACP=949 下，GBK 均不能被 949 抢走
-        let broken_entry: &[u8] = b"bad_\xFF.jpg";
-        for acp in [936u32, 949, 950, 932] {
-            let decoded = decode_zip_entry_names_with_acp(&[gbk_1, broken_entry], acp);
+        // 1. 无论系统是简体 / 繁体 / 韩文 / 日文 / 西欧，GBK 归档都必须解成简体中文而不是韩文乱码
+        for acp in [936u32, 949, 950, 932, 1252] {
             assert_eq!(
-                decoded[0], "第1话/封面.jpg",
-                "ACP={acp} 回退分支下不应将 GBK 解成韩文乱码"
+                decode_zip_entry_names_with_acp(&unflagged(&[gbk_1]), acp),
+                vec!["第1话/封面.jpg"],
+                "ACP={acp}"
+            );
+            assert_eq!(
+                decode_zip_entry_names_with_acp(&unflagged(&[gbk_1, gbk_2]), acp),
+                vec!["第1话/封面.jpg", "第01卷/彩页/目录.jpg"],
+                "ACP={acp}"
             );
         }
 
-        // 3. 真实韩文 CP949 归档在韩文系统 (ACP = 949) 及回退分支下仍应保持正确韩文解码，不被反向误伤
+        // 2. 归档里混入 1 个所有 CJK 代码页都无法严格解码的条目时，
+        //    惩罚是「每条一次」而不是整体丢弃，GBK 仍然不能被 949 抢走
+        let broken_entry: &[u8] = b"bad_\xFF.jpg";
+        for acp in [936u32, 949, 950, 932] {
+            let decoded = decode_zip_entry_names_with_acp(&unflagged(&[gbk_1, broken_entry]), acp);
+            assert_eq!(
+                decoded[0], "第1话/封面.jpg",
+                "ACP={acp} 混入坏条目后不应将 GBK 解成韩文乱码"
+            );
+        }
+
+        // 3. 真实韩文 CP949 归档在韩文系统 (ACP = 949) 下仍应保持正确韩文解码，不被反向误伤
         let kr_1: &[u8] = &[
             0xC1, 0xA6, 0x31, 0xC8, 0xAD, 0x2F, 0xC7, 0xA5, 0xC1, 0xF6, 0x2E, 0x6A, 0x70, 0x67,
         ];
@@ -678,10 +930,11 @@ mod tests {
             0x2E, 0x6A, 0x70, 0x67,
         ];
         assert_eq!(
-            decode_zip_entry_names_with_acp(&[kr_1, kr_2, kr_3], 949),
+            decode_zip_entry_names_with_acp(&unflagged(&[kr_1, kr_2, kr_3]), 949),
             vec!["제1화/표지.jpg", "쌍둥이/1화.jpg", "특집/사건/끝판.jpg"]
         );
-        let kr_fallback = decode_zip_entry_names_with_acp(&[kr_1, kr_2, kr_3, broken_entry], 949);
+        let kr_fallback =
+            decode_zip_entry_names_with_acp(&unflagged(&[kr_1, kr_2, kr_3, broken_entry]), 949);
         assert_eq!(
             &kr_fallback[..3],
             ["제1화/표지.jpg", "쌍둥이/1화.jpg", "특집/사건/끝판.jpg"]
@@ -695,4 +948,29 @@ mod tests {
         assert!(!norm.contains('/'));
         assert!(norm.ends_with(r"E:\Manga\out\vol1.pdf"));
     }
+
+    #[test]
+    fn test_verbatim_prefix_stripping_handles_unc_and_drive_paths() {
+        // 普通扩展路径：只剥 `\\?\`
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\E:\Manga\out\vol1.pdf"),
+            r"E:\Manga\out\vol1.pdf"
+        );
+        // 网络路径：必须还原成 `\\server\share\...`，
+        // 裸剥 `\\?\` 会得到 explorer 打不开的 `UNC\server\share\a.pdf`
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\a.pdf"),
+            r"\\server\share\a.pdf"
+        );
+        // 普通 UNC 与非扩展路径保持原样，只把正斜杠换反斜杠
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\server\share/a.pdf"),
+            r"\\server\share\a.pdf"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"E:\Manga\vol1.pdf"),
+            r"E:\Manga\vol1.pdf"
+        );
+    }
 }
+

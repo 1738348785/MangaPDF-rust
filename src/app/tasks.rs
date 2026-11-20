@@ -37,7 +37,10 @@ impl MangaPdfApp {
             //   2. 若文件夹根目录直接含有图片，仅导入根目录一级图片，并在存在含图子目录时记录提示；
             //   3. 若根目录无直接图片但含多个有效子文件夹，自动拆分为多个独立分卷；
             //   4. 若根目录无直接图片且仅有单层包装子目录，自动递归提取内部图片或归档。
-            let mut expanded_dirs: Vec<(PathBuf, bool)> = Vec::new();
+            //
+            // 每项是 `(要导入的目录, 是否递归, 分卷名覆盖)`：分卷名覆盖用于「单层包装目录」
+            // （`MyManga/Ch01/` 这种），路径取子目录以保证递归判定正确，名字仍沿用父目录。
+            let mut expanded_dirs: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
             let mut archive_files: Vec<PathBuf> = Vec::new();
             let mut loose_images: Vec<PathBuf> = Vec::new();
             let mut skipped_subfolders: Vec<String> = Vec::new();
@@ -55,7 +58,7 @@ impl MangaPdfApp {
 
                 if p.is_dir() {
                     if scan_sub {
-                        expanded_dirs.push((p.clone(), true));
+                        expanded_dirs.push((p.clone(), true, None));
                         archive_files.extend(source::collect_archive_files(
                             &p,
                             true,
@@ -65,9 +68,11 @@ impl MangaPdfApp {
                         let direct_archives =
                             source::collect_archive_files(&p, false, Some(&cancel));
                         if source::dir_has_root_images(&p) {
-                            expanded_dirs.push((p.clone(), false));
+                            // 根目录本身就有散图：按「单卷」导入，只附带直属归档，
+                            // 含图子目录（蒙版/翻译缓存等）记为跳过并提示，不拆成新分卷
+                            expanded_dirs.push((p.clone(), false, None));
                             archive_files.extend(direct_archives);
-                            let skipped = source::get_direct_subfolders(&p);
+                            let skipped = source::get_direct_subfolders(&p, Some(&cancel));
                             if !skipped.is_empty() {
                                 let parent_label = derive_folder_sequence_name(&p);
                                 for sub in skipped {
@@ -77,28 +82,39 @@ impl MangaPdfApp {
                                 }
                             }
                         } else {
-                            let subfolders = source::get_direct_subfolders(&p);
-                            if subfolders.len() > 1 {
-                                for sub in subfolders {
-                                    let sub_rec = !source::dir_has_root_images(&sub);
-                                    expanded_dirs.push((sub, sub_rec));
-                                }
-                                archive_files.extend(direct_archives);
-                            } else if !direct_archives.is_empty() {
-                                archive_files.extend(direct_archives);
-                                if let Some(only_sub) = subfolders.into_iter().next() {
-                                    let sub_rec = !source::dir_has_root_images(&only_sub);
-                                    expanded_dirs.push((only_sub, sub_rec));
-                                }
-                            } else if subfolders.len() == 1 {
-                                expanded_dirs.push((p.clone(), true));
+                            // 根目录没有散图：每个含图子目录各自成为一个分卷。
+                            // 单子目录也走同一条路径（旧实现给它单独写死了 `push((p, true))`），
+                            // 否则「只有 1 个子目录」时递归判定会与多子目录分支不一致，
+                            // mask/ 这类只装蒙版的深层目录会被整包递归吸进分卷。
+                            let subfolders = source::get_direct_subfolders(&p, Some(&cancel));
+                            let had_direct_archives = !direct_archives.is_empty();
+                            // 「单层包装目录」（`MyManga/Ch01/`）保持旧行为：分卷仍叫 MyManga，
+                            // 只是递归判定改走子目录，避免把 mask/ 之类深层目录整包吸进来
+                            let wrapper_name = if subfolders.len() == 1 && !had_direct_archives {
+                                Some(derive_folder_sequence_name(&p))
                             } else {
-                                // 根目录既无图片也无直属归档/含图子目录：尝试探测嵌套 .zip/.cbz 归档
+                                None
+                            };
+                            for sub in &subfolders {
+                                // 子目录自己根一级就有图片时不再往下递归
+                                let sub_rec = !source::dir_has_root_images(sub);
+                                expanded_dirs.push((sub.clone(), sub_rec, wrapper_name.clone()));
+                                // 子目录里也可能只有 .cbz/.zip：一并扫出来，
+                                // 否则「1 个散图子目录 + 1 个只装归档的子目录」的混合目录
+                                // 会静默漏掉整卷（旧实现直接落进 len()==1 分支跳过 else 分支）
+                                archive_files.extend(source::collect_archive_files(
+                                    sub,
+                                    false,
+                                    Some(&cancel),
+                                ));
+                            }
+                            archive_files.extend(direct_archives);
+
+                            if subfolders.is_empty() && !had_direct_archives {
+                                // 既无图片也无含图子目录：尝试探测嵌套 .zip/.cbz 归档
                                 let nested_archives =
                                     source::collect_archive_files(&p, true, Some(&cancel));
-                                if !nested_archives.is_empty() {
-                                    archive_files.extend(nested_archives);
-                                } else {
+                                if nested_archives.is_empty() {
                                     // 记录目录内常见但不支持的漫画/图片格式，便于给出清晰引导
                                     for ext in source::collect_unsupported_media_exts_in_dir(
                                         &p,
@@ -107,6 +123,8 @@ impl MangaPdfApp {
                                     ) {
                                         unsupported_exts.insert(ext);
                                     }
+                                } else {
+                                    archive_files.extend(nested_archives);
                                 }
                             }
                         }
@@ -145,7 +163,7 @@ impl MangaPdfApp {
             let mut groups = Vec::new();
             let mut errors: Vec<String> = Vec::new();
 
-            for (p, recursive) in expanded_dirs {
+            for (p, recursive, name_override) in expanded_dirs {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(TaskMessage::Cancelled {
                         message: "已取消导入".to_string(),
@@ -155,7 +173,7 @@ impl MangaPdfApp {
                     return;
                 }
                 // 兼容直接选择盘符根目录 (如 `D:\`) 时 `file_name()` 为空的情况，避免产生空分卷名与空输出文件名
-                let seq_name = derive_folder_sequence_name(&p);
+                let seq_name = name_override.unwrap_or_else(|| derive_folder_sequence_name(&p));
                 let progress_tx = tx.clone();
                 let label = seq_name.clone();
                 let cb = move |current: usize, total: usize, name: &str| {
@@ -188,7 +206,9 @@ impl MangaPdfApp {
                         if !entries.is_empty() {
                             groups.push(ImportedGroup {
                                 seq_name: Some(seq_name),
-                                out_dir: p.parent().map(|d| d.to_path_buf()),
+                                // 相对路径的 parent() 是空路径而不是 None，
+                                // 必须过滤掉，否则空串会覆盖默认输出目录
+                                out_dir: crate::util::parent_dir_non_empty(&p),
                                 entries,
                             });
                         } else {
@@ -250,7 +270,9 @@ impl MangaPdfApp {
                         if !entries.is_empty() {
                             groups.push(ImportedGroup {
                                 seq_name: Some(seq_name),
-                                out_dir: p.parent().map(|d| d.to_path_buf()),
+                                // 相对路径的 parent() 是空路径而不是 None，
+                                // 必须过滤掉，否则空串会覆盖默认输出目录
+                                out_dir: crate::util::parent_dir_non_empty(&p),
                                 entries,
                             });
                         }
@@ -294,8 +316,7 @@ impl MangaPdfApp {
                 if !entries.is_empty() {
                     let out_dir = loose_images
                         .first()
-                        .and_then(|first| first.parent())
-                        .map(|d| d.to_path_buf());
+                        .and_then(|first| crate::util::parent_dir_non_empty(first));
                     groups.push(ImportedGroup {
                         seq_name: None,
                         out_dir,
@@ -345,7 +366,7 @@ impl MangaPdfApp {
         }
     }
 
-    pub(super) fn trigger_generate_current(&mut self) {
+    pub(super) fn trigger_generate_current(&mut self, frame: Option<&eframe::Frame>) {
         if self.is_generating || self.is_importing {
             return;
         }
@@ -382,7 +403,7 @@ impl MangaPdfApp {
                 );
                 return;
             }
-            let confirm = rfd::MessageDialog::new()
+            let confirm = crate::app::message_dialog(frame)
                 .set_title("PDF 文件已存在")
                 .set_description(format!(
                     "目标文件已存在：\n{}\n\n是否确认覆盖此文件？",

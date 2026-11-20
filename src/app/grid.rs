@@ -11,6 +11,7 @@ impl MangaPdfApp {
         theme: &PanelTheme,
         is_busy: bool,
         is_hovering_files: bool,
+        frame: Option<&eframe::Frame>,
     ) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if is_busy {
@@ -193,7 +194,7 @@ impl MangaPdfApp {
             });
 
             if response.clicked() && !is_busy {
-                if let Some(files) = rfd::FileDialog::new()
+                if let Some(files) = super::file_dialog(frame)
                     .add_filter(
                         "图片或漫画归档",
                         &["jpg", "jpeg", "png", "webp", "bmp", "jfif", "zip", "cbz"],
@@ -277,10 +278,17 @@ impl MangaPdfApp {
                 let mut remove_action = None;
                 let mut preview_action = None;
 
+                // 滚动位置按分卷隔离：所有分卷共用一个固定 id 时，切到页数少的分卷会沿用上一个分卷的
+                // 偏移量而停在半空，切回来又丢了原来的位置
+                let scroll_seq_id = self
+                    .sequences
+                    .get(self.active_sequence_idx)
+                    .map_or(0, |seq| seq.id);
+
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.y = GAP_Y;
                     egui::ScrollArea::vertical()
-                        .id_salt("image_cards_scroll")
+                        .id_salt(("image_cards_scroll", scroll_seq_id))
                         .auto_shrink([false, false])
                         .show_rows(ui, CARD_OUTER_H, total_rows, |ui, row_range| {
                             // 每帧按实时长度裁剪区间，杜绝任何"本帧中途条目被清空"导致的切片越界
@@ -537,16 +545,28 @@ impl MangaPdfApp {
                                                                 .truncate(),
                                                             );
 
+                                                            // 解码与头解析都失败的图片不再写死 800×1200 假装正常，
+                                                            // 宽高为 0 时明确显示「尺寸未知」
+                                                            let size_label = if item.width == 0
+                                                                || item.height == 0
+                                                            {
+                                                                "尺寸未知".to_string()
+                                                            } else {
+                                                                format!(
+                                                                    "{} × {}",
+                                                                    item.width, item.height
+                                                                )
+                                                            };
+
                                                             ui.add(
                                                                 egui::Label::new(
-                                                                    egui::RichText::new(format!(
-                                                                        "{} × {}",
-                                                                        item.width, item.height
-                                                                    ))
-                                                                    .font(FontId::proportional(
-                                                                        10.0,
-                                                                    ))
-                                                                    .color(theme.text_muted),
+                                                                    egui::RichText::new(size_label)
+                                                                        .font(
+                                                                            FontId::proportional(
+                                                                                10.0,
+                                                                            ),
+                                                                        )
+                                                                        .color(theme.text_muted),
                                                                 )
                                                                 .truncate(),
                                                             );

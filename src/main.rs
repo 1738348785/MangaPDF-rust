@@ -49,7 +49,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// 配置 Windows 中文字体（优先使用微软雅黑 msyh.ttc）
+/// 配置 Windows 中文字体（优先使用微软雅黑 msyh.ttc），并追加韩文回退字体
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
@@ -59,32 +59,41 @@ fn setup_custom_fonts(ctx: &egui::Context) {
         .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
     let fonts_dir = windows_dir.join("Fonts");
 
-    let font_candidates = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"];
+    // 中文字体插到字体列表最前面，保证中文字形优先
+    if let Some((key, data)) = first_readable_font(
+        &fonts_dir,
+        &["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"],
+        "chinese_font",
+    ) {
+        fonts.font_data.insert(key.clone(), FontData::from_owned(data));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().insert(0, key.clone());
+        }
+    }
 
-    for file_name in font_candidates {
-        let path = fonts_dir.join(file_name);
-        if path.exists() {
-            if let Ok(font_data) = fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("chinese_font".to_owned(), FontData::from_owned(font_data));
-
-                fonts
-                    .families
-                    .entry(FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "chinese_font".to_owned());
-
-                fonts
-                    .families
-                    .entry(FontFamily::Monospace)
-                    .or_default()
-                    .insert(0, "chinese_font".to_owned());
-
-                break;
-            }
+    // 韩文回退：微软雅黑 / 黑体 / 宋体都不含谚文，导入 CP949 韩文归档后分卷名与文件名
+    // 会整片显示成方块 □□。追加到字体列表**末尾**，只补缺失字形，完全不改动中文字形。
+    if let Some((key, data)) = first_readable_font(
+        &fonts_dir,
+        &["malgun.ttf", "malgunbd.ttf", "batang.ttc", "gulim.ttc"],
+        "korean_font",
+    ) {
+        fonts.font_data.insert(key.clone(), FontData::from_owned(data));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(key.clone());
         }
     }
 
     ctx.set_fonts(fonts);
+}
+
+/// 依次尝试候选字体文件名，返回第一个存在且可读的字体（附上注册用的字体键名）
+fn first_readable_font(
+    fonts_dir: &std::path::Path,
+    candidates: &[&str],
+    font_key: &str,
+) -> Option<(String, Vec<u8>)> {
+    candidates
+        .iter()
+        .find_map(|file_name| Some((font_key.to_owned(), fs::read(fonts_dir.join(file_name)).ok()?)))
 }

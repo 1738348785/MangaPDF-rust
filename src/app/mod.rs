@@ -103,6 +103,25 @@ struct ImportedGroup {
     entries: Vec<ImageEntry>,
 }
 
+/// 构造文件选择对话框，并把它绑定到主窗口作为 owner。
+///
+/// 这些 `rfd` 对话框都是在 UI 主线程上同步阻塞弹出的；Windows 下没有 owner `HWND` 的弹窗
+/// 一旦被用户点击主窗口或切换应用，就会落到已被阻塞的主窗口背后，表现为「点一下按钮就假死」。
+pub(super) fn file_dialog(frame: Option<&eframe::Frame>) -> rfd::FileDialog {
+    match frame {
+        Some(f) => rfd::FileDialog::new().set_parent(f),
+        None => rfd::FileDialog::new(),
+    }
+}
+
+/// 构造原生消息对话框并绑定主窗口 owner（原因同 [`file_dialog`]）
+pub(super) fn message_dialog(frame: Option<&eframe::Frame>) -> rfd::MessageDialog {
+    match frame {
+        Some(f) => rfd::MessageDialog::new().set_parent(f),
+        None => rfd::MessageDialog::new(),
+    }
+}
+
 enum TaskMessage {
     Progress {
         current: usize,
@@ -239,9 +258,17 @@ impl MangaPdfApp {
         app.apply_modern_styling(&cc.egui_ctx);
 
         // 支持直接将漫画文件夹、图片或 .zip/.cbz 拖拽到 exe 图标启动
+        //
+        // 相对路径必须先转绝对路径：`MangaPDF.exe vol1.cbz` 时 `Path::new("vol1.cbz").parent()`
+        // 返回的是空路径（不是 None），会让「输出保存目录」变成空串、导出跑到桌面；
+        // `MangaPDF.exe .` 则会让 `file_name()` 为空、分卷名退化成 ".盘"。
         let cli_paths: Vec<PathBuf> = std::env::args_os()
             .skip(1)
-            .map(PathBuf::from)
+            .map(|raw| {
+                let raw = PathBuf::from(raw);
+                // `absolute` 只做「拼接当前目录 + 去掉 . 与 ..」，不会触碰磁盘，也不解析链接
+                std::path::absolute(&raw).unwrap_or(raw)
+            })
             .filter(|p| p.exists())
             .collect();
         if !cli_paths.is_empty() {
@@ -509,7 +536,7 @@ impl eframe::App for MangaPdfApp {
         bg.to_normalized_gamma_f32()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.handle_async_messages(ctx);
 
         let is_busy = self.is_generating || self.is_importing;
@@ -539,10 +566,10 @@ impl eframe::App for MangaPdfApp {
         self.render_bottom_bar(ctx, &theme, is_busy);
 
         // 3. 左侧控制面板
-        self.render_left_panel(ctx, &theme, is_busy);
+        self.render_left_panel(ctx, &theme, is_busy, Some(frame));
 
         // 4. 中间主面板
-        self.render_central_panel(ctx, &theme, is_busy, is_hovering_files);
+        self.render_central_panel(ctx, &theme, is_busy, is_hovering_files, Some(frame));
 
         // 5. 关于对话框
         self.render_about_dialog(ctx, &theme);

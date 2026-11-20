@@ -81,8 +81,10 @@ pub fn create_image_entry(
     source_path: Option<PathBuf>,
     archive_source: Option<ArchiveEntryRef>,
 ) -> ImageEntry {
-    let mut width = 800;
-    let mut height = 1200;
+    // 默认 0×0 表示「尺寸未知」：解码与头解析双双失败时，写死一个 800×1200 会骗用户以为图片正常，
+    // 卡片上再显示「尺寸未知」也自相矛盾。真正能头解析的图片仍会拿到真实宽高。
+    let mut width = 0;
+    let mut height = 0;
     let mut thumb_rgb = None;
     let mut thumb_w = 0;
     let mut thumb_h = 0;
